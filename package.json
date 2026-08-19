@@ -1,0 +1,33 @@
+{
+  "name": "@deepseek-ai/dsh-tool-design-to-code",
+  "version": "0.0.1",
+  "description": "设计稿 + 需求 → 符合项目约定的 React/TS 高质量代码生成器（无外部依赖）",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/types/index.d.ts",
+  "files": [
+    "lib"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jackchen13755/dsh-design-to-code.git"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/dsh-tool-figma-reader": "github:jackchen13755/dsh-figma-reader#main"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": ">=0.0.1-rc <2",
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc <2",
+    "cordis": ">=4.0.0-rc <5",
+    "schemastery": "^3.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "build": "bash scripts/build.sh",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}
