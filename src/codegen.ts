@@ -13,6 +13,12 @@ export interface CodegenOptions {
   requirements: string
   conventions: string
   outputDir: string
+  /** figma_audit_node 生成的核对清单 markdown（内联进 Codegen Prompt） */
+  auditMd?: string
+  /** 当前轮次（多轮生成） */
+  round?: number
+  /** 上一轮反馈（round>1 时） */
+  roundFeedback?: string
 }
 
 function safeName(name: string): string {
@@ -55,8 +61,42 @@ function escapeAttr(s: string): string {
   return s.replace(/"/g, '&quot;').replace(/&/g, '&amp;')
 }
 
+/** 节点边框：strokePaints + strokeWeight + dashPattern（虚线坑：用 dashPattern 不是 strokeDashes）。 */
+function strokeCss(n: DesignNode): string | undefined {
+  const r = n.raw
+  const sp = Array.isArray(r.strokePaints) ? r.strokePaints.find((p: any) => p.visible !== false && p.color) : undefined
+  if (!sp?.color) return undefined
+  const c = sp.color
+  const a = sp.opacity ?? c.a ?? 1
+  const color = `rgba(${Math.round((c.r ?? 0) * 255)},${Math.round((c.g ?? 0) * 255)},${Math.round((c.b ?? 0) * 255)},${a})`
+  const w = typeof r.strokeWeight === 'number' ? r.strokeWeight : 1
+  const dash = Array.isArray(r.dashPattern) && r.dashPattern.length ? 'dashed' : 'solid'
+  return `${w}px ${dash} ${color}`
+}
+
+/** 节点阴影：effects（含 visible）。 */
+function shadowCss(n: DesignNode): string | undefined {
+  const r = n.raw
+  const e = (r.effects ?? []).find((x: any) => x && x.visible !== false && (x.type === 'DROP_SHADOW' || x.type === 'INNER_SHADOW'))
+  if (!e) return undefined
+  const c = e.color ?? {}
+  const a = e.opacity ?? c.a ?? 1
+  const inset = e.type === 'INNER_SHADOW' ? ' inset' : ''
+  return `${e.offset?.x ?? 0}px ${e.offset?.y ?? 0}px ${e.radius ?? 0}px ${e.spread ?? 0}px rgba(${Math.round((c.r ?? 0) * 255)},${Math.round((c.g ?? 0) * 255)},${Math.round((c.b ?? 0) * 255)},${a})${inset}`.trim()
+}
+
+function baseStyle(n: DesignNode): string {
+  const parts: string[] = [`left: ${n.x}`, `top: ${n.y}`, `width: ${n.w}`, `height: ${n.h}`]
+  if (n.background) parts.push(`background: '${n.background}'`)
+  const border = strokeCss(n)
+  if (border) parts.push(`border: '${border}'`)
+  const shadow = shadowCss(n)
+  if (shadow) parts.push(`boxShadow: '${shadow}'`)
+  return `{ ${parts.join(', ')} }`
+}
+
 function renderNode(n: DesignNode, flat: DesignNode[], index: number): string {
-  const style = `{ left: ${n.x}, top: ${n.y}, width: ${n.w}, height: ${n.h}${n.background ? `, background: '${n.background}'` : ''} }`
+  const style = baseStyle(n)
   const pos = `style={${style}}`
   switch (n.kind) {
     case 'text': {
@@ -70,8 +110,7 @@ function renderNode(n: DesignNode, flat: DesignNode[], index: number): string {
     }
     case 'button': {
       const label = descendantText(n, ACTION_RE) ?? n.name
-      const bg = n.background ? `, background: '${n.background}'` : ''
-      return `      <button className={styles.button} style={{ left: ${n.x}, top: ${n.y}, width: ${n.w}, height: ${n.h}${bg} }} onClick={() => onAction?.("${escapeAttr(label)}", data)}>${escapeText(label)}</button>`
+      return `      <button className={styles.button} ${pos} onClick={() => onAction?.("${escapeAttr(label)}", data)}>${escapeText(label)}</button>`
     }
     case 'icon-close':
       return `      <button className={styles.close} ${pos} aria-label="关闭" onClick={onClose}>×</button>`
@@ -140,30 +179,82 @@ export function generateCode(model: DesignModel, opts: CodegenOptions): string[]
   writeFileSync(join(outDir, 'design-spec.json'), JSON.stringify(model, null, 2), 'utf8')
 
   // ── CODEGEN_PROMPT.md ──
-  writeFileSync(
-    join(outDir, 'CODEGEN_PROMPT.md'),
-    `# Codegen Prompt（需求 → 最终代码）
-
-设计稿已提取为 \`design-spec.json\`（令牌/树/文本），骨架见 \`src/${name}.tsx\`。
-
-请按以下要求把骨架补全为高质量实现：
-
-## 需求
-${opts.requirements}
-
-## 项目约定
-${opts.conventions}
-
-## 必做
-1. 依据需求把控件标签映射成语义字段（如“房号”→ roomNumber），重写 \`types.ts\` 的 Props；
-2. 补全交互：受控表单、校验、按钮动作（复制卡/制新卡）、关闭（Esc/遮罩）、可访问性；
-3. 保持 \`tokens.ts\` 的设计值，不改样式数字；
-4. 复用项目已有的 Button/Input/Modal 原子组件（若有）；没有则保持零外部依赖；
-5. 输出：\`src/${name}.tsx\`、\`src/types.ts\`、\`src/use${name}.ts\`（逻辑 hooks）、必要测试；
-6. 代码简洁、可扩展、类型安全，不引入第三方运行时依赖。
-`,
-    'utf8',
+  const round = Math.max(1, opts.round ?? 1)
+  const promptParts = [
+    `# Codegen Prompt（需求 → 最终代码）· 第 ${round} 轮`,
+    '',
+    `设计稿已提取为 \`design-spec.json\`（令牌/树/文本），骨架见 \`src/${name}.tsx\`。`,
+    '',
+    '请按以下要求把骨架补全为高质量实现：',
+    '',
+    '## 需求',
+    opts.requirements,
+    '',
+    '## 项目约定',
+    opts.conventions,
+    '',
+  ]
+  if (opts.auditMd) {
+    promptParts.push(
+      '## 设计审计核对清单（实现前逐项勾选，歧义项不要猜）',
+      '',
+      '```markdown',
+      opts.auditMd.trim(),
+      '```',
+      '',
+    )
+  }
+  if (round > 1 && opts.roundFeedback) {
+    promptParts.push(
+      `## 第 ${round} 轮反馈（上一轮差异/评审）`,
+      '',
+      opts.roundFeedback,
+      '',
+    )
+  }
+  promptParts.push(
+    `## 必做`,
+    `1. 依据需求把控件标签映射成语义字段（如“房号”→ roomNumber），重写 \`types.ts\` 的 Props；`,
+    `2. 补全交互：受控表单、校验、按钮动作、关闭（Esc/遮罩）、可访问性；`,
+    `3. 保持 \`tokens.ts\` 的设计值，不改样式数字；边框虚线用设计稿的 \`dashPattern\`；`,
+    `4. 复用项目已有的 Button/Input/Modal 原子组件（若有）；没有则保持零外部依赖；`,
+    `5. 输出：\`src/${name}.tsx\`、\`src/types.ts\`、\`src/use${name}.ts\`（逻辑 hooks）、必要测试；`,
+    `6. 代码简洁、可扩展、类型安全，不引入第三方运行时依赖。`,
+    '',
+    '## 运行时行为：先查项目既有实现，再写代码（不要自己发明）',
+    '',
+    '在目标仓库内 grep 以下关键词，找到对应组件后读源码照抄既有模式：',
+    '',
+    '```bash',
+    '# 固定/吸底相关',
+    'grep -rn "position: fixed" src --include="*.less" --include="*.css"',
+    'grep -rn "position: sticky" src --include="*.less" --include="*.css"',
+    'grep -rn "bottom: 0" src --include="*.less" --include="*.css"',
+    '',
+    '# 现有 footer/操作栏实现',
+    'grep -rn "footer-wrap\\|profile-footer-wrap\\|ant-row-flex-end" src --include="*.tsx" --include="*.less"',
+    '',
+    '# 侧边栏展开/收起',
+    'grep -rn "collapsed\\|is-collapse\\|menu-collapsed\\|side.*bar" src --include="*.tsx" --include="*.less" | head -50',
+    '',
+    '# 布局宽度',
+    'grep -rn "220px\\|width: 220" src --include="*.less"',
+    '```',
+    '',
+    '例如：若项目已有底部操作栏约定（如 \`profile-footer-wrap\`：position: fixed; width: 100%; left: 0; bottom: 0; z-index: 20），',
+    '就照抄该模式（靠侧边栏遮挡自适应展开/收起），不要自己写死 left:220px。',
+    '',
+    '## 验证闭环',
+    '1. 本地 WS 解码 JSON → 审计清单逐项勾选；',
+    '2. 有歧义节点（fill visible=false / strokeWeight>0 但无 strokePaints）标记“待人工确认”，不要猜；',
+    '3. 视觉参照：REST 可用时用 figma_read_node 渲染 PNG；429 时用 figma_read_node_ws 截浏览器视口对照；',
+    '4. 全部 checklist 勾选 + 截图对照无差异后才算完成。',
+    '',
+    '## 沉淀可复用事实',
+    '把查到的既有模式（如“本应用底部操作栏统一用 profile-footer-wrap：fixed + width 100% + left 0”）记入 Noema，',
+    '下次同类页面直接复用，不再重新踩坑。',
   )
+  writeFileSync(join(outDir, 'CODEGEN_PROMPT.md'), promptParts.join('\n'), 'utf8')
 
   // ── README.md ──
   writeFileSync(
