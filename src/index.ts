@@ -9,6 +9,9 @@ import { buildDesignModel } from './design.js'
 import { generateCode } from './codegen.js'
 import { auditNode, auditToMarkdown } from './audit.js'
 
+export const name = '@deepseek-ai/dsh-tool-design-to-code'
+export const inject = ['tools']
+
 export interface Config {
   /** figma_ws 捕获目录（浏览器扩展静默生成），默认 ~/Downloads/figma_ws。 */
   wsCaptureDir?: string
@@ -251,5 +254,3 @@ export function apply(ctx: Context, config: Config): void {
     return disposers
   }, '@deepseek-ai/dsh-tool-design-to-code')
 }
-
-export default apply
