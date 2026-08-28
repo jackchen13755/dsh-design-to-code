@@ -1,4 +1,4 @@
-import type { Context } from 'cordis';
+import type { Context } from '@deepseek-ai/cordis';
 import z from 'schemastery';
 export declare const name = "@deepseek-ai/dsh-tool-design-to-code";
 export declare const inject: string[];
