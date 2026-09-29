@@ -1,6 +1,6 @@
 {
   "name": "@deepseek-ai/dsh-tool-design-to-code",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "设计稿 + 需求 → 符合项目约定的 React/TS 高质量代码生成器（无外部依赖）",
   "type": "module",
   "main": "./lib/index.js",
@@ -18,8 +18,6 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1 || >=0.1.6-alpha.1 <0.2",
-    "@deepseek-ai/dsh-tools": "^0.1.2-rc.1 || >=0.1.6-alpha.1 <0.2",
     "schemastery": "^3.18.0"
   },
   "devDependencies": {
