@@ -14,7 +14,7 @@ DSH 工具：**设计稿 → 可核对的视觉基准 / 审计清单 / 代码骨
 
 | 工具 | 场景 | 作用 |
 |---|---|---|
-| `figma_render_static` | **新建 / 改造，第一步** | 逐节点渲染 1:1 **静态还原页** `static/index.html` + 规格/映射表 `SPEC.md`。这是唯一的视觉基准，人工先确认它 |
+| `figma_render_static` | **新建 / 改造，第一步** | 逐节点渲染 1:1 **静态还原页** `static/index.html` + 规格/映射表 `SPEC.md` + **设计基准图 PNG**（`index.png` / `index@2x.png`，无头 Chrome 出图，供人和 UI 专家子 agent 读图审计） |
 | `figma_change_brief` | **需求是"在现有页面上改几处"** | 新稿 → 静态基准页 + **旧稿 vs 新稿的逐字段设计差异** + 在目标仓库里 grep 出的**代码落点候选** + 逐条变更计划模板 `CHANGE.md` |
 | `figma_audit_node` | 新建 | 实现前核对清单（逐边描边/逐角圆角/字体/auto-layout）；把「真歧义（要问设计）」与「数据缺失（按兜底规则做）」分开 |
 | `figma_gen_component` | 新建 | 设计 + 需求 → React/TS/CSS Modules **几何骨架** + Codegen Prompt（实例渲染为语义占位并带 `data-design-name` 供替换为项目组件） |
@@ -61,6 +61,21 @@ DSH 工具：**设计稿 → 可核对的视觉基准 / 审计清单 / 代码骨
 6. **auto-layout 的 `stackMode/stackSpacing/stackPadding*` 都在数据里**：绝对定位只是静态还原的手段，
    落到组件时应转成 flex。
 
+## 设计基准图（给 UI 专家子 agent 读图用）
+
+`figma_render_static` 默认同时导出 `static/index.png`（1x）与 `static/index@2x.png`（2x，1px 描边也看得清），
+用**无头 Chrome** 渲染静态还原页得到：尺寸精确、无编辑器浮层、可复现，且**不依赖 Figma 出图权限**
+（设计文件常被设成 "Export disabled"，走官方出图会直接失败）。
+
+工具返回值里会附一段「交给 UI 专家的读图材料」，主 agent 转交时**原样抄进任务书**：
+设计基准图路径 + 基准页路径 + SPEC 路径 + 审计要求（逐条 问题/位置/期望/实际/级别）。
+
+两类图的定位要分清：
+- **设计基准图（本工具产出）**：与 SPEC 规格表同源 → 适合审计**结构/尺寸/逐边描边/逐角圆角/字体**；
+  实例（Input/Select/按钮）是按设计系统重建的占位，其内部细节不作为审计依据。
+- **Figma 画布截图（figma_read_node_ws 产出）**：真实观感（图标、质感），但含编辑器浮层且裁剪不稳定 →
+  只作辅助，不做像素级依据。
+
 ## 静态还原页不是"要搬进项目的样式"
 
 `static/index.html` 是视觉基准（绝对定位 + 内联样式 + 设计稿 literal 色值），
@@ -99,6 +114,7 @@ output_dir/
 
 ## 变更记录
 
+- **0.1.2**：`figma_render_static` 增加设计基准图 PNG 导出（无头 Chrome）+「交给 UI 专家的读图材料」。
 - **0.1.1**：流程硬门禁（缺基准页拒生成、未确认/有未关闭整改项拒收尾）+ `figma_confirm_static`
   人工确认状态（`flow.json`）+ `figma_review_to_round`（专家整改清单闭环）。
 - **0.1.0**：新增 `figma_render_static`（视觉基准）与 `figma_change_brief`（改现有页面）；

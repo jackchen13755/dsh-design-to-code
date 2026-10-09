@@ -262,7 +262,11 @@ export function renderStatic(model: DesignModel, opts: StaticRenderOptions): { h
   const html = `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <title>设计稿静态还原 ${model.nodeId} · ${esc(title)}</title>
+<script>// 出图模式：?png=1 时隐藏调试浮层、去掉灰底，保证截图是"干净的设计图"
+if (location.search.indexOf('png=1') >= 0) document.documentElement.className += ' png-mode';</script>
 <style>
+  html.png-mode #hud{display:none!important}
+  html.png-mode body{background:#fff}
   html,body{margin:0;padding:0;background:#dedede}
   body{font-family:'${ds.fontFamily}',system-ui,-apple-system,'PingFang SC',sans-serif}
   #frame{width:${model.width}px;height:${model.height}px;position:relative;overflow:hidden;margin:0;background:#fff;outline:1px solid #000}
