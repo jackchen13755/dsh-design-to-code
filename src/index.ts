@@ -151,13 +151,18 @@ function makeBoxResolver(staticDir: string): { resolve: (nodeId: string) => [num
 }
 
 /** 轮次游标（.codegen-round）：figma_codegen_round 与 figma_review_to_round 共用 */
+/** 轮次游标：没有记录时是**第 0 轮**（下一次 +1 = 第 1 轮）；不要默认成 1，否则第一轮会被叫成"第 2 轮" */
 async function readRound(dir: string): Promise<number> {
-  try { return Number(await readFile(join(dir, '.codegen-round'), 'utf8')) || 1 } catch { return 1 }
+  try { return Number(await readFile(join(dir, '.codegen-round'), 'utf8')) || 0 } catch { return 0 }
 }
 
-/** 找"生成目录"（含 CODEGEN_PROMPT.md 的那层）：调用方可能给 outDir 或 outDir/gen */
+/**
+ * 找"生成目录"（含 CODEGEN_PROMPT.md 的那层）。
+ * 只在**本次输出目录内部**找（dir 或 dir/gen）——不要向上找：
+ * 实测向上找两层会命中隔壁另一个旧的 gen/ 目录，把评审记录写进无关目录（真跑时踩到）。
+ */
 async function findGenDir(dir: string): Promise<string | null> {
-  for (const cand of [dir, join(dir, 'gen'), resolve(dir, '..'), join(resolve(dir, '..'), 'gen')]) {
+  for (const cand of [dir, join(dir, 'gen')]) {
     if (existsSync(join(cand, 'CODEGEN_PROMPT.md'))) return cand
   }
   return null
@@ -489,7 +494,14 @@ export function apply(ctx: Context, config: Config): void {
         }
 
         // ── add ──
-        if (!genDir) throw new Error(`找不到 CODEGEN_PROMPT.md（在 ${start} 及其 gen/ 下都没有）：先跑 figma_gen_component`)
+        // 基准审计（scope=baseline）发生在 figma_gen_component **之前**，那时还没有 CODEGEN_PROMPT.md，
+        // 所以不能一律要求 gen 目录存在：基准审计只写评审记录 + 标注图，不往 Prompt 里注入。
+        const scopeArg = args.scope === 'baseline' ? 'baseline' : 'implementation'
+        // 评审记录目录：有 gen 就放 gen/review，否则放 outDir/review —— md 直接落在这个目录里
+        const recordDir = genDir ? join(genDir, 'review') : join(flowDir, 'review')
+        if (!genDir && scopeArg !== 'baseline') {
+          throw new Error(`找不到 CODEGEN_PROMPT.md（在 ${start} 及其 gen/ 下都没有）：先跑 figma_gen_component`)
+        }
         const explicit = parseItemsJson(args.items)
         const staticDir = join(flowDir, 'static')
         const resolver = makeBoxResolver(staticDir)
@@ -503,19 +515,22 @@ export function apply(ctx: Context, config: Config): void {
         if (!items.length) {
           throw new Error('没能从 review 里解析出任何条目。请把清单写成列表/表格，或用 items 传结构化 JSON（JSON.parse 后的数组）')
         }
-        const round = (await readRound(genDir)) + 1
+        const round = (await readRound(recordDir)) + 1
         const at = new Date().toISOString()
         const reviewer = args.reviewer || 'expert'
         // 条目 id 必须**跨轮唯一**：否则第 2 轮的 R1 与第 4 轮的 R1 会互相误关。
         // 统一改成 `<轮次>.<序号>`，并在输出里回显让调用方照抄。
         for (let i = 0; i < items.length; i++) items[i] = { ...items[i], id: `${round}.${i + 1}` }
         const block = renderReviewRound(items, { round, reviewer, at, source: args.source, extra: args.review })
-        const promptPath = join(genDir, 'CODEGEN_PROMPT.md')
-        await writeFile(promptPath, `${await readFile(promptPath, 'utf8')}\n${block}`, 'utf8')
-        await writeFile(join(genDir, '.codegen-round'), String(round), 'utf8')
+        if (genDir) {
+          const promptPath = join(genDir, 'CODEGEN_PROMPT.md')
+          await writeFile(promptPath, `${await readFile(promptPath, 'utf8')}\n${block}`, 'utf8')
+        }
+        await mkdir(recordDir, { recursive: true })
+        await writeFile(join(recordDir, '.codegen-round'), String(round), 'utf8')
 
         const state: ReviewItemState[] = items.map((it) => ({ ...it, status: 'open' }))
-        const scope = args.scope === 'baseline' ? 'baseline' : 'implementation'
+        const scope = scopeArg
         const verdict = verdictOf(items)
 
         // ── 标出有问题的地方：把问题按 id 钉在设计基准图上 ──
@@ -555,8 +570,8 @@ export function apply(ctx: Context, config: Config): void {
         })
 
         // 落一份人可读的评审记录
-        await mkdir(join(genDir, 'review'), { recursive: true })
-        await writeFile(join(genDir, 'review', `round-${round}.md`), [
+        await mkdir(recordDir, { recursive: true })
+        await writeFile(join(recordDir, `round-${round}.md`), [
           `# 第 ${round} 轮专家整改清单`,
           '',
           `- 评审人：${reviewer} · 时间：${at}${args.source ? ` · 来源：${args.source}` : ''}`,
@@ -573,7 +588,7 @@ export function apply(ctx: Context, config: Config): void {
         ].join('\n'), 'utf8')
 
         // ── 打回清单：开发照着改，改完必须复审拿 pass ──
-        const rejectPath = join(genDir, 'review', `round-${round}-${verdict === 'reject' ? 'REJECT' : 'PASS'}.md`)
+        const rejectPath = join(recordDir, `round-${round}-${verdict === 'reject' ? 'REJECT' : 'PASS'}.md`)
         await writeFile(rejectPath, renderRejectionMarkdown({
           round, reviewer, at, verdict,
           items: items.map((it) => ({ id: it.id, severity: it.severity, text: it.text, box: it.box ?? null, location: it.location })),
@@ -584,10 +599,10 @@ export function apply(ctx: Context, config: Config): void {
 
         const open = openItems(reviews)
         return [
-          `${verdict === 'reject' ? '❌ 审计打回' : '✅ 审计通过'} · 已接进第 ${round} 轮（${genDir}）`,
+          `${verdict === 'reject' ? '❌ 审计打回' : '✅ 审计通过'} · 第 ${round} 轮（${recordDir}）`,
           `- 评审人：${reviewer} · 条目：${items.length}（阻断 ${items.filter((i) => i.severity === 'blocker').length} / 主要 ${items.filter((i) => i.severity === 'major').length} / 次要 ${items.filter((i) => i.severity === 'minor').length}）`,
-          `- 已注入：${promptPath}`,
-          `- 评审记录：${join(genDir, 'review', `round-${round}.md`)}`,
+          genDir ? `- 已注入：${join(genDir, 'CODEGEN_PROMPT.md')}` : '- 基准审计：未注入 Prompt（发生在生成骨架之前，属预期）',
+          `- 评审记录：${join(recordDir, `round-${round}.md`)}`,
           `- ${verdict === 'reject' ? '打回清单' : '通过记录'}：${rejectPath}`,
           annotatedImage ? `- 标注图（问题已按 id 钉在基准图上）：${annotatedImage}` : '- 标注图：未生成（缺少 static/spec.json 或没有可解析的坐标）',
           `- 审计对象：${scope} · 状态：${summarizeRounds(reviews)}`,
@@ -793,7 +808,7 @@ export function apply(ctx: Context, config: Config): void {
               `  2) figma_review_to_round(output_dir="${found.dir}", review=<专家原文>, reviewer="UI 视觉验收设计师")`,
               '  3) 按条目改 → action="close" 逐条关闭',
               '',
-              '专家默认在 Agency 设置里关闭；确实没有专家可用时，可传 force=true 显式越过（会留痕在 flow.json 里）。',
+              '若当前环境没有可用的 UI 专家（Agency 设置里未启用），可传 force=true 显式越过；会留痕在 flow.json 里，交付时须注明「未经专家审计」。',
             ].join('\n'))
           }
           const rounds = found.flow.reviews ?? []

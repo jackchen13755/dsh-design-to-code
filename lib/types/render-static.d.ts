@@ -1,4 +1,4 @@
-import type { DesignModel } from './design.js';
+import type { DesignModel, DesignNode } from './design.js';
 export interface StaticRenderOptions {
     outputDir: string;
     /** 组件/页面名（用于标题） */
@@ -18,6 +18,8 @@ interface Ds {
     controlH: number;
     fontFamily: string;
 }
+/** 是否处于"拼接控件组"的中间：同一父级下，左右都有兄弟且水平间距 ≤1px（设计用 stackSpacing=-1 表达共用一条边） */
+export declare function middleOfJoinedGroup(n: DesignNode): boolean;
 /** 从设计数据里"投票"出设计系统常量，避免把某个项目的色值写死在插件里 */
 export declare function inferDesignSystem(model: DesignModel): Ds;
 /** 生成 SPEC.md：设计规格 + 到项目 token 的映射表（右列由人/会话填） */

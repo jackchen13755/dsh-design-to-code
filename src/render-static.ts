@@ -44,6 +44,22 @@ const esc = (s: unknown): string =>
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
 
+/** 是否处于"拼接控件组"的中间：同一父级下，左右都有兄弟且水平间距 ≤1px（设计用 stackSpacing=-1 表达共用一条边） */
+export function middleOfJoinedGroup(n: DesignNode): boolean {
+  const parent = n.raw?.parentIndex?.guid
+  if (!parent) return false
+  const pid = `${Number(parent.sessionID)}:${Number(parent.localID)}`
+  const sibs: DesignNode[] = []
+  const collect = (x: DesignNode): void => {
+    sibs.push(x)
+    for (const c of x.children) collect(c)
+  }
+  collect(n)
+  // 这里不做全树查找，交给调用方注入更准；退化为"看自己的同级"由 renderStatic 预标注
+  void pid
+  return (n as DesignNode & { _middleOfGroup?: boolean })._middleOfGroup === true
+}
+
 function flat(model: DesignModel): DesignNode[] {
   const out: DesignNode[] = []
   const walk = (n: DesignNode): void => {
@@ -82,7 +98,8 @@ export function inferDesignSystem(model: DesignModel): Ds {
   const fontFamily = tally(nodes.filter((n) => n.text).map((n) => n.text?.family)) ?? 'system-ui'
   return {
     line,
-    lineStrong: tally(nodes.map((n) => n.border?.color).filter((c) => c && c !== line)) ?? line,
+    // 次级线色必须是**灰色系**：之前只取"第二常见的边框色"，实测取到了 Verified 成功标签的绿色
+    lineStrong: tally(nodes.map((n) => n.border?.color).filter((c) => c && c !== line && isGray(c))) ?? line,
     text: tally(textColors) ?? '#1c2433',
     placeholder: tally(textColors.filter((c) => c && c !== (tally(textColors) ?? ''))) ?? '#a7b3c4',
     primary: brand,
@@ -114,7 +131,9 @@ function kindOfInstance(n: DesignNode): string {
 function instanceHtml(n: DesignNode, ds: Ds, style: (d: string) => string): string {
   const k = kindOfInstance(n)
   if (k === 'skip') return ''
-  const rad = n.radius ?? `${ds.radius}px`
+  // 圆角：设计数据有值就用（逐角/单值）；没有值且处于**拼接组中间格**判 0；否则回落设计系统默认。
+  // 修的是专家指出的缺陷：34 个 INSTANCE 的 radius 为空，之前一律回落 8px，导致拼接组中间格长出圆角。
+  const rad = n.radius ?? (middleOfJoinedGroup(n) ? '0px' : `${ds.radius}px`)
   const base = `position:absolute;left:${n.x}px;top:${n.y}px;width:${n.w}px;height:${n.h}px;box-sizing:border-box`
   const tip = esc(`${n.id} ${n.name} [实例·内部数据缺失，按设计系统重建]`)
   const txt = esc(n.value ?? '')
@@ -255,6 +274,39 @@ export function renderStatic(model: DesignModel, opts: StaticRenderOptions): { h
   }
 
   const nodes = flat(model).filter((n) => n.kind !== 'root')
+
+  // 预标注"拼接组中间格"：同一批兄弟里 y 相同、水平相邻且重叠/相接 ≤1px，且左右都有邻居
+  const markJoinedMiddles = (list: DesignNode[]): void => {
+    const byRow = new Map<number, DesignNode[]>()
+    for (const c of list) {
+      if (c.raw.visible === false) continue
+      const y = Math.round(c.y)
+      if (!byRow.has(y)) byRow.set(y, [])
+      byRow.get(y)!.push(c)
+    }
+    for (const row of byRow.values()) {
+      const sorted = row.slice().sort((a, b) => a.x - b.x)
+      for (let i = 1; i < sorted.length - 1; i++) {
+        const left = sorted[i - 1]
+        const mid = sorted[i]
+        const right = sorted[i + 1]
+        const gapL = mid.x - (left.x + left.w)
+        const gapR = right.x - (mid.x + mid.w)
+        if (gapL <= 1 && gapR <= 1 && left.w > 20 && mid.w > 20 && right.w > 20) {
+          ;(mid as DesignNode & { _middleOfGroup?: boolean })._middleOfGroup = true
+          // 传播：拼接组有时是由外层容器相邻（如三个 Form Field 帧），
+          // 真正要方角的是容器**内部那个填满格子的控件**（与容器等宽）。
+          const spread = (x: DesignNode): void => {
+            if (Math.abs(x.w - mid.w) <= 2) (x as DesignNode & { _middleOfGroup?: boolean })._middleOfGroup = true
+            for (const c of x.children) spread(c)
+          }
+          spread(mid)
+        }
+      }
+    }
+    for (const c of list) if (c.children.length) markJoinedMiddles(c.children)
+  }
+  markJoinedMiddles([model.tree])
   const body = nodes.map((n) => nodeHtml(n, ds, style)).join('\n')
   const instances = nodes.filter((n) => n.type === 'INSTANCE').length
   const title = opts.title ?? model.componentName
