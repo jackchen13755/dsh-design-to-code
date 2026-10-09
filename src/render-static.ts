@@ -44,20 +44,18 @@ const esc = (s: unknown): string =>
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
 
-/** 是否处于"拼接控件组"的中间：同一父级下，左右都有兄弟且水平间距 ≤1px（设计用 stackSpacing=-1 表达共用一条边） */
-export function middleOfJoinedGroup(n: DesignNode): boolean {
-  const parent = n.raw?.parentIndex?.guid
-  if (!parent) return false
-  const pid = `${Number(parent.sessionID)}:${Number(parent.localID)}`
-  const sibs: DesignNode[] = []
-  const collect = (x: DesignNode): void => {
-    sibs.push(x)
-    for (const c of x.children) collect(c)
-  }
-  collect(n)
-  // 这里不做全树查找，交给调用方注入更准；退化为"看自己的同级"由 renderStatic 预标注
-  void pid
-  return (n as DesignNode & { _middleOfGroup?: boolean })._middleOfGroup === true
+/**
+ * 拼接控件组里的角色（由 renderStatic 预标注）：
+ * - 'mid'      中间格 → 四角全方（radius 0）
+ * - 'leftEnd'  左端格 → **右侧两角方**（共用边不能有圆角）
+ * - 'rightEnd' 右端格 → **左侧两角方**
+ * 规则是**结构性的**：同一行内子项水平相邻且间距 ≤1px（重叠 1px 或 0 间隙）就算拼接；
+ * 与设计是否显式写了 0px 无关（很多实例的 radius 字段就是空的）。
+ * 上一版只处理了"中间格"且只在 3 格行生效，专家复审实测出右端格（132:9306/132:9324）仍带全圆角。
+ */
+export type JoinRole = 'mid' | 'leftEnd' | 'rightEnd'
+export function joinRoleOf(n: DesignNode): JoinRole | undefined {
+  return (n as DesignNode & { _joinRole?: JoinRole })._joinRole
 }
 
 function flat(model: DesignModel): DesignNode[] {
@@ -131,9 +129,21 @@ function kindOfInstance(n: DesignNode): string {
 function instanceHtml(n: DesignNode, ds: Ds, style: (d: string) => string): string {
   const k = kindOfInstance(n)
   if (k === 'skip') return ''
-  // 圆角：设计数据有值就用（逐角/单值）；没有值且处于**拼接组中间格**判 0；否则回落设计系统默认。
-  // 修的是专家指出的缺陷：34 个 INSTANCE 的 radius 为空，之前一律回落 8px，导致拼接组中间格长出圆角。
-  const rad = n.radius ?? (middleOfJoinedGroup(n) ? '0px' : `${ds.radius}px`)
+  // 圆角：设计数据有值就用；没有值时按**拼接角色**推：中间格 0、左端格右侧两角方、右端格左侧两角方。
+  // （专家复审实测：34 个 INSTANCE 的 radius 为空，旧逻辑一律回落 8px →
+  //   三格拼接的中间格、以及右边缘落在实例上的格子都会长出圆角。）
+  const role = joinRoleOf(n)
+  // CSS border-radius 顺序是 TL TR BR BL：
+  //   左端格（共用边在右）→ TR/BR 方 → `8px 0px 0px 8px`
+  //   右端格（共用边在左）→ TL/BL 方 → `0px 8px 8px 0px`
+  //   中间格 → 四角全方 → `0px`
+  const rad = n.radius ?? (role === 'mid'
+    ? '0px'
+    : role === 'leftEnd'
+      ? `${ds.radius}px 0px 0px ${ds.radius}px`
+      : role === 'rightEnd'
+        ? `0px ${ds.radius}px ${ds.radius}px 0px`
+        : `${ds.radius}px`)
   const base = `position:absolute;left:${n.x}px;top:${n.y}px;width:${n.w}px;height:${n.h}px;box-sizing:border-box`
   const tip = esc(`${n.id} ${n.name} [实例·内部数据缺失，按设计系统重建]`)
   const txt = esc(n.value ?? '')
@@ -238,6 +248,7 @@ export function renderSpecMarkdown(model: DesignModel, ds: Ds, projectName?: str
   L.push('| **逐边**描边（如只有左边框） | 见第 3 节 border 列 | 用 `border-width` 分边，别用整框再想办法去掉三条边 |')
   L.push('| **逐角**圆角（拼接组两端圆角/中间直角） | 见第 3 节 radius 列 | 相邻控件重叠 1px 共用一条边 |')
   L.push('| auto-layout | 见第 3 节 layout 列 | 转成 flex，而不是绝对定位 |')
+  L.push('| **拼接控件组** | 同行相邻且**间距 ≤1px** 判为拼接 | 共用边强制直角：左端格 `8 0 0 8`、**中间格 `0`**、右端格 `0 8 8 0`；有真实间隙（如 16px）的不算拼接 |')
   L.push('')
   L.push('## 3. 逐节点规格表')
   L.push('')
@@ -249,7 +260,30 @@ export function renderSpecMarkdown(model: DesignModel, ds: Ds, projectName?: str
     )
   }
   L.push('')
-  L.push('## 4. 已知占位')
+  // 标注类实例（手型光标/光标等）：是工程态残留，不是 UI，实现不渲染。
+  // 这一节解决的是"同一列里出现两个看着都像当前项"的误判：把状态变体逐个标出来。
+  const annos: Array<{ id: string; name: string; parent: string; parentName: string }> = []
+  const walkAnno = (n: DesignNode, parent: DesignNode | null): void => {
+    if (n.type === 'INSTANCE' && /hand|cursor|光标/i.test(n.name)) {
+      annos.push({ id: n.id, name: n.name, parent: parent?.id ?? '-', parentName: parent?.name ?? '-' })
+    }
+    for (const c of n.children) walkAnno(c, n)
+  }
+  walkAnno(model.tree, null)
+  if (annos.length) {
+    L.push('## 4. 标注类实例（**实现不渲染**）')
+    L.push('')
+    L.push('| 标注节点 | 图层名 | 所在父节点 | 父节点名 | 说明 |')
+    L.push('|---|---|---|---|---|')
+    for (const a of annos) {
+      L.push(`| ${a.id} | ${a.name} | ${a.parent} | ${a.parentName} | 设计稿的交互标注（如手型光标），**不要实现成 UI** |`)
+    }
+    L.push('')
+    L.push('> 若同一组控件里出现**多个视觉状态变体**（选中 / 悬停 / 禁用），它们各自是独立节点：')
+    L.push('> 请按上面的节点 ID 逐个对照（例如"带标注实例的那个是悬停预览"），**不要当成多个"当前项"**。')
+    L.push('')
+  }
+  L.push('## 5. 已知占位')
   L.push('')
   L.push('- 实例（INSTANCE）在解码数据里没有内部结构/填充/描边，本页按 `size + 逐角圆角 + 覆写文案 + 设计系统常量` **重建**；')
   L.push('  文案来自 `symbolData.symbolOverrides[].textData.characters`。图标（下拉箭头/日历/删除/单选）为近似占位。')
@@ -275,8 +309,9 @@ export function renderStatic(model: DesignModel, opts: StaticRenderOptions): { h
 
   const nodes = flat(model).filter((n) => n.kind !== 'root')
 
-  // 预标注"拼接组中间格"：同一批兄弟里 y 相同、水平相邻且重叠/相接 ≤1px，且左右都有邻居
-  const markJoinedMiddles = (list: DesignNode[]): void => {
+  // 预标注"拼接组角色"：同一父级下 y 相同、水平相邻且间距 ≤1px 视为拼接；
+  // 中间格四角全方，两端格只把**共用边**那两角方掉。
+  const markJoinedRoles = (list: DesignNode[]): void => {
     const byRow = new Map<number, DesignNode[]>()
     for (const c of list) {
       if (c.raw.visible === false) continue
@@ -285,28 +320,26 @@ export function renderStatic(model: DesignModel, opts: StaticRenderOptions): { h
       byRow.get(y)!.push(c)
     }
     for (const row of byRow.values()) {
-      const sorted = row.slice().sort((a, b) => a.x - b.x)
-      for (let i = 1; i < sorted.length - 1; i++) {
-        const left = sorted[i - 1]
-        const mid = sorted[i]
-        const right = sorted[i + 1]
-        const gapL = mid.x - (left.x + left.w)
-        const gapR = right.x - (mid.x + mid.w)
-        if (gapL <= 1 && gapR <= 1 && left.w > 20 && mid.w > 20 && right.w > 20) {
-          ;(mid as DesignNode & { _middleOfGroup?: boolean })._middleOfGroup = true
-          // 传播：拼接组有时是由外层容器相邻（如三个 Form Field 帧），
-          // 真正要方角的是容器**内部那个填满格子的控件**（与容器等宽）。
-          const spread = (x: DesignNode): void => {
-            if (Math.abs(x.w - mid.w) <= 2) (x as DesignNode & { _middleOfGroup?: boolean })._middleOfGroup = true
-            for (const c of x.children) spread(c)
-          }
-          spread(mid)
+      const sorted = row.slice().sort((a, b) => a.x - b.x).filter((c) => c.w > 20)
+      for (let i = 0; i < sorted.length; i++) {
+        const cur = sorted[i]
+        const prev = sorted[i - 1]
+        const next = sorted[i + 1]
+        const touchL = !!prev && cur.x - (prev.x + prev.w) <= 1
+        const touchR = !!next && next.x - (cur.x + cur.w) <= 1
+        if (!touchL && !touchR) continue
+        const role: JoinRole = touchL && touchR ? 'mid' : touchL ? 'rightEnd' : 'leftEnd'
+        const setRole = (x: DesignNode): void => {
+          ;(x as DesignNode & { _joinRole?: JoinRole })._joinRole = role
+          // 传播到"填满该格子的内部控件"（容器相邻时，真正要方角的是里面等宽的那个控件）
+          for (const c of x.children) if (Math.abs(c.w - x.w) <= 2) setRole(c)
         }
+        setRole(cur)
       }
     }
-    for (const c of list) if (c.children.length) markJoinedMiddles(c.children)
+    for (const c of list) if (c.children.length) markJoinedRoles(c.children)
   }
-  markJoinedMiddles([model.tree])
+  markJoinedRoles([model.tree])
   const body = nodes.map((n) => nodeHtml(n, ds, style)).join('\n')
   const instances = nodes.filter((n) => n.type === 'INSTANCE').length
   const title = opts.title ?? model.componentName
