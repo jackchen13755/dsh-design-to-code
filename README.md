@@ -17,7 +17,7 @@ DSH 工具：**设计稿 → 可核对的视觉基准 / 审计清单 / 代码骨
 | `figma_render_static` | **新建 / 改造，第一步** | 逐节点渲染 1:1 **静态还原页** `static/index.html` + 规格/映射表 `SPEC.md` + **设计基准图 PNG**（`index.png` / `index@2x.png`，无头 Chrome 出图，供人和 UI 专家子 agent 读图审计） |
 | `figma_change_brief` | **需求是"在现有页面上改几处"** | 新稿 → 静态基准页 + **旧稿 vs 新稿的逐字段设计差异** + 在目标仓库里 grep 出的**代码落点候选** + 逐条变更计划模板 `CHANGE.md` |
 | `figma_audit_node` | 新建 | 实现前核对清单（逐边描边/逐角圆角/字体/auto-layout）；把「真歧义（要问设计）」与「数据缺失（按兜底规则做）」分开 |
-| `figma_gen_component` | 新建 | 设计 + 需求 → React/TS/CSS Modules **几何骨架** + Codegen Prompt（实例渲染为语义占位并带 `data-design-name` 供替换为项目组件） |
+| `figma_gen_component` | 新建 | 设计 + 需求 → React/TS/CSS Modules **几何骨架 + 组件化拆分**（把设计里的重复结构抽成**带 props 的可复用组件**，页面只做组合）+ `component-plan.md`（复用清单 / 应抽组件 / **按项目实际探测的落点**）+ Codegen Prompt |
 | `figma_confirm_static` | 人工确认 | 记录"用户已确认基准页"（确认人/时间/备注/已知差异，可 reset）；未确认时收尾会被拒 |
 | `figma_review_to_round` | **主流程必需（涉及 UI）** | 把 UI 专家/验收专家的清单解析成结构化条目 → **按 id 把问题钉在设计基准图上出标注图** → 注入下一轮 `CODEGEN_PROMPT.md` → 逐条记 open/closed。有 blocker/major 即判 **打回(reject)**，关闭后**必须复审拿 pass** 才允许收尾 |
 | `figma_codegen_round` | 新建，第 2+ 轮 | 在已有输出上追加下一轮差异指令，迭代到差异清零 |
@@ -60,6 +60,23 @@ DSH 工具：**设计稿 → 可核对的视觉基准 / 审计清单 / 代码骨
    落实现时必须用项目既有组件重建，插件只给占位与规格。
 6. **auto-layout 的 `stackMode/stackSpacing/stackPadding*` 都在数据里**：绝对定位只是静态还原的手段，
    落到组件时应转成 flex。
+
+## 组件化（生成代码的硬要求）
+
+`figma_gen_component` 传 `code_dir` 后会做三件事（结论落在 `gen/component-plan.md`，并注入 Prompt）：
+
+1. **复用清单**：设计里的实例（Input / Select / 日期选择 / Button / Radio / 标签 / 上传…）→ 建议复用的项目组件；
+2. **应抽组件**：从设计数据里统计**重复结构**（同一形状反复出现）→ 给出建议组件名与 **props（属性名取自设计文案）**；
+   同时列出**不值得抽**的结构（`title` ×35、`Row`、`Frame 1171278644` 这类），避免"什么都被抽成组件"；
+   同名多变体（Input/Select/日期选择 版 Form Field）会提示**合成一个组件用 props 区分**，而不是做成 N 个；
+3. **落点按项目实际**：扫描目标仓库得出组件根目录 / 目录形态（`X/index.tsx` 还是 `X.tsx`）/ 样式后缀 / 有无 barrel，
+   新组件就按这个形态落地（探测依据是真实文件路径，列在方案里供核对）。
+
+生成物示例（SPMS-6031）：原本 362 个裸 `<div>` 的平铺骨架 → 拆成
+`FormField`(×9 用法) / `FormFieldSelect`(×18) / `FormFieldSelectV2`(×3) 三个带 props 的组件 + 组合页。
+
+> ⚠️ **安全约束**：本工具**只写输出目录**，绝不写进目标项目（项目里已有哪些文件插件并不知道，
+> 直接写会污染/覆盖用户仓库）。项目落点写在 `component-plan.md`，由会话在实现阶段创建。
 
 ## 设计基准图（给 UI 专家子 agent 读图用）
 
@@ -114,6 +131,8 @@ output_dir/
 
 ## 变更记录
 
+- **0.1.4**：代码生成组件化——重复结构自动抽成带 props 的可复用组件、页面只做组合；
+  项目组件约定探测（落点/形态/样式/barrel）；生成物只写输出目录（修掉"写进项目"的破坏性缺陷）。
 - **0.1.3**：UI 专家审计进入主流程——标注图（问题按 id 钉在基准图上）+ 打回判定（blocker/major = reject）
   + 复审门禁（关闭不等于通过，末轮必须 pass）；审计通过即视为确认（不再要求人工确认）。
 - **0.1.2**：`figma_render_static` 增加设计基准图 PNG 导出（无头 Chrome）+「交给 UI 专家的读图材料」。
