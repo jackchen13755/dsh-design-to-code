@@ -25,6 +25,7 @@ export declare function renderSpecMarkdown(model: DesignModel, ds: Ds, projectNa
 export declare function renderStatic(model: DesignModel, opts: StaticRenderOptions): {
     htmlPath: string;
     specPath?: string;
+    specJsonPath: string;
     stats: {
         nodes: number;
         rules: number;

@@ -19,7 +19,7 @@ DSH 工具：**设计稿 → 可核对的视觉基准 / 审计清单 / 代码骨
 | `figma_audit_node` | 新建 | 实现前核对清单（逐边描边/逐角圆角/字体/auto-layout）；把「真歧义（要问设计）」与「数据缺失（按兜底规则做）」分开 |
 | `figma_gen_component` | 新建 | 设计 + 需求 → React/TS/CSS Modules **几何骨架** + Codegen Prompt（实例渲染为语义占位并带 `data-design-name` 供替换为项目组件） |
 | `figma_confirm_static` | 人工确认 | 记录"用户已确认基准页"（确认人/时间/备注/已知差异，可 reset）；未确认时收尾会被拒 |
-| `figma_review_to_round` | **专家整改清单** | 把 UI 专家/验收专家的清单解析成结构化条目 → 注入下一轮 `CODEGEN_PROMPT.md` → 逐条记 open/closed；**未关闭项不允许收尾** |
+| `figma_review_to_round` | **主流程必需（涉及 UI）** | 把 UI 专家/验收专家的清单解析成结构化条目 → **按 id 把问题钉在设计基准图上出标注图** → 注入下一轮 `CODEGEN_PROMPT.md` → 逐条记 open/closed。有 blocker/major 即判 **打回(reject)**，关闭后**必须复审拿 pass** 才允许收尾 |
 | `figma_codegen_round` | 新建，第 2+ 轮 | 在已有输出上追加下一轮差异指令，迭代到差异清零 |
 
 ### 两条推荐流程
@@ -114,6 +114,8 @@ output_dir/
 
 ## 变更记录
 
+- **0.1.3**：UI 专家审计进入主流程——标注图（问题按 id 钉在基准图上）+ 打回判定（blocker/major = reject）
+  + 复审门禁（关闭不等于通过，末轮必须 pass）；审计通过即视为确认（不再要求人工确认）。
 - **0.1.2**：`figma_render_static` 增加设计基准图 PNG 导出（无头 Chrome）+「交给 UI 专家的读图材料」。
 - **0.1.1**：流程硬门禁（缺基准页拒生成、未确认/有未关闭整改项拒收尾）+ `figma_confirm_static`
   人工确认状态（`flow.json`）+ `figma_review_to_round`（专家整改清单闭环）。

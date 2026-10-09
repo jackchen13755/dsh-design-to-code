@@ -10,9 +10,10 @@ import { generateCode, summarizeAudit } from './codegen.js'
 import { auditModel, auditToMarkdown } from './audit.js'
 import { renderStatic } from './render-static.js'
 import { findCodeHits, keywordsOf, renderChangeMarkdown } from './diff.js'
-import { expertImageBrief, exportStaticPagePng, pngPathsFor, pngSummary } from './screenshot.js'
+import { expertImageBrief, exportStaticPagePng, pngPathsFor, pngSummary, renderHtmlToPng } from './screenshot.js'
+import { buildAnnotatedHtml, legendHeightFor, renderRejectionMarkdown, verdictOf, type AnnotationInput } from './annotate.js'
 import {
-  openItems, parseReview, renderReviewRound, summarizeRounds,
+  hasExpertReview, openByeSeverity, openItems, parseReview, renderReviewRound, summarizeRounds,
   type ReviewItem, type ReviewItemState, type ReviewRoundState,
 } from './review.js'
 
@@ -84,9 +85,13 @@ interface FlowState {
   staticPage?: string
   specPath?: string
   confirmed: boolean
+  /** 谁确认的基准页：human（人看基准页）| expert_review（UI 专家审计通过，按流程约定可替代人工确认） */
+  confirmedVia?: 'human' | 'expert_review'
   confirmedBy?: string
   confirmedAt?: string
   confirmNote?: string
+  /** 涉及 UI 的交付必须走一轮 UI 专家审计（默认 true；figma_codegen_round 会据此卡收尾） */
+  expertReviewRequired?: boolean
   /** 专家整改清单的轮次记录（figma_review_to_round 维护） */
   reviews?: ReviewRoundState[]
   updatedAt: string
@@ -119,6 +124,29 @@ async function writeFlow(outDir: string, patch: Partial<FlowState> & Pick<FlowSt
   return next
 }
 
+/**
+ * 从静态基准页旁边的 spec.json 里读逐节点坐标，
+ * 让审计清单里写的"132:8240"能落到基准图上的框（= 标出有问题的地方）。
+ */
+function makeBoxResolver(staticDir: string): { resolve: (nodeId: string) => [number, number, number, number] | null; width: number; height: number } | null {
+  const p = join(staticDir, 'spec.json')
+  if (!existsSync(p)) return null
+  try {
+    const j = JSON.parse(readFileSync(p, 'utf8')) as { width: number; height: number; rows: Array<{ id: string; x: number; y: number; w: number; h: number }> }
+    const byId = new Map(j.rows.map((r) => [r.id, r]))
+    return {
+      width: j.width,
+      height: j.height,
+      resolve: (nodeId: string) => {
+        const r = byId.get(nodeId)
+        return r ? [r.x, r.y, r.w, r.h] as [number, number, number, number] : null
+      },
+    }
+  } catch {
+    return null
+  }
+}
+
 /** 轮次游标（.codegen-round）：figma_codegen_round 与 figma_review_to_round 共用 */
 async function readRound(dir: string): Promise<number> {
   try { return Number(await readFile(join(dir, '.codegen-round'), 'utf8')) || 1 } catch { return 1 }
@@ -144,6 +172,8 @@ function parseItemsJson(raw?: string): ReviewItem[] | null {
       location: it.location ? String(it.location) : undefined,
       expected: it.expected ? String(it.expected) : undefined,
       actual: it.actual ? String(it.actual) : undefined,
+      nodeId: it.node_id ? String(it.node_id) : (it.nodeId ? String(it.nodeId) : undefined),
+      box: Array.isArray(it.box) && it.box.length === 4 ? (it.box.map(Number) as [number, number, number, number]) : undefined,
     })).filter((it) => it.text)
   } catch {
     return null
@@ -247,10 +277,13 @@ export function apply(ctx: Context, config: Config): void {
           '',
           `- 流程状态：${join(outDir, 'flow.json')}（confirmed=false）`,
           '',
-          '【必须做·交接给用户】把下面这句话连同路径原样交给用户，等他确认：',
-          `  「请打开 ${r.htmlPath} 对照设计稿确认（结构/尺寸/逐边描边/逐角圆角/字体）；确认后我再实现组件」`,
-          '主 agent 请用 present/sidebar_open 把基准页直接呈现给用户，不要只在回复里贴路径。',
-          `确认通过后调用 figma_confirm_static(output_dir="${outDir}") 记录确认，再进入 figma_gen_component。`,
+          '【必须做·二选一（主流程）】',
+          '  方式 A（推荐，UI 相关默认走这条）：把基准图交给 UI 专家做**基准审计**',
+          '    summon_expert("UI 视觉验收设计师", 任务) → 任务里带上面两张基准图路径 + 基准页 + SPEC',
+          `    → figma_review_to_round(output_dir="${outDir}", review=<专家原文>, scope="baseline", reviewer="UI 视觉验收设计师")`,
+          '    → 走完这一步即视为基准已确认（confirmedVia=expert_review），**不需要人工再确认一遍**。',
+          '  方式 B（没有专家可用时）：主 agent 用 present/sidebar_open 把基准页呈现给用户，',
+          `    用户确认后调用 figma_confirm_static(output_dir="${outDir}")（confirmedVia=human）。`,
           '',
           '提醒：这一页是**视觉基准**，样式不要直接搬进项目（映射规则见 SPEC.md 第 2 节）。',
           brief ? `\n${brief}` : '',
@@ -339,6 +372,7 @@ export function apply(ctx: Context, config: Config): void {
       parameters: {
         output_dir: { type: 'string', description: 'figma_render_static / figma_change_brief 的输出目录（含 flow.json）' },
         by: { type: 'string', description: '确认人（用户名/角色）' },
+        via: { type: 'string', description: "确认来源：human（人看过基准页，默认）| expert_review（UI 专家审计通过）" },
         note: { type: 'string', description: '确认说明；有差异就写清"哪些差异已接受"（不要写"看起来没问题"）' },
         diffs: { type: 'string', description: '确认时仍存在的已知差异（逗号分隔），会一并记录' },
         reset: { type: 'boolean', description: 'true = 撤销确认（设计稿改了要重新确认时用）' },
@@ -347,7 +381,7 @@ export function apply(ctx: Context, config: Config): void {
         schema: { type: 'string' },
         render: (_args: unknown, value: unknown) => [textBlock(String(value))],
       },
-      async execute(args: { output_dir: string; by?: string; note?: string; diffs?: string; reset?: boolean }) {
+      async execute(args: { output_dir: string; by?: string; via?: string; note?: string; diffs?: string; reset?: boolean }) {
         const dir = resolve(args.output_dir)
         const prev = await readFlow(dir)
         if (!prev) throw new Error(`找不到 ${join(dir, 'flow.json')}：先跑 figma_render_static（或 figma_change_brief）`)
@@ -356,16 +390,18 @@ export function apply(ctx: Context, config: Config): void {
           return `♻️ 已撤销基准页确认（${dir}）\n- 当前 confirmed=${next.confirmed}；改完设计稿请重新渲染并再次确认。`
         }
         const note = [args.note, args.diffs ? `已知差异：${args.diffs}` : ''].filter(Boolean).join(' | ')
+        const via = args.via === 'expert_review' ? 'expert_review' : 'human'
         const next = await writeFlow(dir, {
           stage: prev.stage, nodeId: prev.nodeId, fileKey: prev.fileKey,
           confirmed: true,
-          confirmedBy: args.by || 'user',
+          confirmedVia: via,
+          confirmedBy: args.by || (via === 'expert_review' ? 'expert' : 'user'),
           confirmedAt: new Date().toISOString(),
           confirmNote: note || undefined,
         })
         return [
           `✅ 已记录基准页人工确认（设计 ${next.fileKey} · 节点 ${next.nodeId}）`,
-          `- 确认人：${next.confirmedBy} · 时间：${next.confirmedAt}`,
+          `- 确认来源：${next.confirmedVia ?? 'human'} · 确认人：${next.confirmedBy} · 时间：${next.confirmedAt}`,
           next.confirmNote ? `- 备注：${next.confirmNote}` : '',
           `- 基准页：${next.staticPage ?? ''}`,
           `- 状态文件：${join(dir, 'flow.json')}`,
@@ -378,13 +414,14 @@ export function apply(ctx: Context, config: Config): void {
     // ── 工具 0d：专家整改清单 → 下一轮任务（把"人味判断"接进闭环） ──
     disposers.push(ctx.tools.register(defineTool({
       name: 'figma_review_to_round',
-      description: '把 UI 专家/验收专家的整改清单接进迭代闭环：解析成结构化条目 → 注入 CODEGEN_PROMPT.md 的下一轮 → 在 flow.json 里逐条记 open/closed。未关闭条目会让 figma_codegen_round 拒绝收尾。action=add 追加评审 / list 查看 / close 关闭条目',
+      description: '【主流程必需】把 UI 专家/验收专家的整改清单接进迭代闭环（涉及 UI 的交付必须至少跑一轮，否则 figma_codegen_round 拒绝收尾）：解析成结构化条目 → 注入 CODEGEN_PROMPT.md 的下一轮 → 在 flow.json 里逐条记 open/closed。未关闭条目会让 figma_codegen_round 拒绝收尾。action=add 追加评审 / list 查看 / close 关闭条目',
       parameters: {
         output_dir: { type: 'string', description: '输出目录（figma_gen_component 的 output_dir 或其 gen 子目录）' },
         action: { type: 'string', description: 'add（默认，追加评审）/ list（查看当前条目状态）/ close（关闭条目）' },
         review: { type: 'string', description: 'add：专家整改清单原文（markdown/列表/表格都行，启发式解析）' },
         items: { type: 'string', description: 'add：显式结构化条目（JSON 数组，优先于 review 解析），如 [{"severity":"major","text":"锚点项应为只有左边框","location":"less/index.less:48"}]' },
         reviewer: { type: 'string', description: 'add：评审人（如 "UI 视觉验收设计师"）' },
+        scope: { type: 'string', description: "add：本轮审计对象：baseline（设计基准图/基准页本身）| implementation（组件实现截图 vs 基准图，默认）" },
         source: { type: 'string', description: 'add：来源（文件路径或说明）' },
         close: { type: 'string', description: 'close：要关闭的条目 id（逗号分隔，如 R1,R3）；也可写 all' },
         closed_by: { type: 'string', description: 'close：关闭人' },
@@ -396,7 +433,7 @@ export function apply(ctx: Context, config: Config): void {
       },
       async execute(args: {
         output_dir: string; action?: string; review?: string; items?: string
-        reviewer?: string; source?: string; close?: string; closed_by?: string; note?: string
+        reviewer?: string; source?: string; close?: string; closed_by?: string; note?: string; scope?: string
       }) {
         const start = resolve(args.output_dir)
         const action = args.action || 'add'
@@ -451,25 +488,67 @@ export function apply(ctx: Context, config: Config): void {
         // ── add ──
         if (!genDir) throw new Error(`找不到 CODEGEN_PROMPT.md（在 ${start} 及其 gen/ 下都没有）：先跑 figma_gen_component`)
         const explicit = parseItemsJson(args.items)
-        const items: ReviewItem[] = explicit ?? parseReview(String(args.review ?? ''))
+        const staticDir = join(flowDir, 'static')
+        const resolver = makeBoxResolver(staticDir)
+        const items: ReviewItem[] = explicit ?? parseReview(String(args.review ?? ''), {
+          resolveBox: resolver ? resolver.resolve : undefined,
+        })
+        // 显式给了 node_id 但没给 box 的，也补上坐标
+        for (const it of items) {
+          if (!it.box && it.nodeId && resolver) it.box = resolver.resolve(it.nodeId)
+        }
         if (!items.length) {
           throw new Error('没能从 review 里解析出任何条目。请把清单写成列表/表格，或用 items 传结构化 JSON（JSON.parse 后的数组）')
         }
         const round = (await readRound(genDir)) + 1
         const at = new Date().toISOString()
         const reviewer = args.reviewer || 'expert'
+        // 条目 id 必须**跨轮唯一**：否则第 2 轮的 R1 与第 4 轮的 R1 会互相误关。
+        // 统一改成 `<轮次>.<序号>`，并在输出里回显让调用方照抄。
+        for (let i = 0; i < items.length; i++) items[i] = { ...items[i], id: `${round}.${i + 1}` }
         const block = renderReviewRound(items, { round, reviewer, at, source: args.source, extra: args.review })
         const promptPath = join(genDir, 'CODEGEN_PROMPT.md')
         await writeFile(promptPath, `${await readFile(promptPath, 'utf8')}\n${block}`, 'utf8')
         await writeFile(join(genDir, '.codegen-round'), String(round), 'utf8')
 
         const state: ReviewItemState[] = items.map((it) => ({ ...it, status: 'open' }))
-        const reviews = [...(found?.flow.reviews ?? []), { round, reviewer, at, source: args.source, items: state } as ReviewRoundState]
+        const scope = args.scope === 'baseline' ? 'baseline' : 'implementation'
+        const verdict = verdictOf(items)
+
+        // ── 标出有问题的地方：把问题按 id 钉在设计基准图上 ──
+        let annotatedImage: string | undefined
+        if (resolver) {
+          const imgFile = 'index.png'
+          const annos: AnnotationInput[] = items.map((it) => ({
+            id: it.id, severity: it.severity, text: it.text,
+            box: it.box ?? null, location: it.location,
+          }))
+          const legendH = legendHeightFor(annos.length)
+          const annHtml = buildAnnotatedHtml({
+            imageFile: imgFile, width: resolver.width, height: resolver.height,
+            annotations: annos, title: `第 ${round} 轮审计`, legendHeight: legendH,
+          })
+          const annHtmlPath = join(staticDir, `annotated-round-${round}.html`)
+          await writeFile(annHtmlPath, annHtml, 'utf8')
+          const png = await renderHtmlToPng({
+            htmlPath: annHtmlPath,
+            outPath: join(staticDir, `annotated-round-${round}.png`),
+            width: resolver.width, height: resolver.height + legendH, scale: 2,
+          })
+          if (png.ok) annotatedImage = png.path
+        }
+        const reviews = [...(found?.flow.reviews ?? []), { round, reviewer, at, source: args.source, scope, verdict, annotatedImage, items: state } as ReviewRoundState]
         await writeFlow(flowDir, {
           stage: found?.flow.stage ?? 'skeleton_generated',
           nodeId: found?.flow.nodeId ?? '',
           fileKey: found?.flow.fileKey ?? '',
           reviews,
+          // 流程约定：走完 UI 专家审计，就不再要求人工再确认一遍基准页。
+          // 但"谁把的关"必须留痕：confirmedVia 记 expert_review，confirmedBy 记专家名。
+          confirmed: found?.flow.confirmed ? true : true,
+          confirmedVia: found?.flow.confirmedVia ?? 'expert_review',
+          confirmedBy: found?.flow.confirmedBy ?? `expert:${reviewer}`,
+          confirmedAt: found?.flow.confirmedAt ?? at,
         })
 
         // 落一份人可读的评审记录
@@ -490,13 +569,28 @@ export function apply(ctx: Context, config: Config): void {
           String(args.review ?? '（未提供原文，来自 items 结构化输入）'),
         ].join('\n'), 'utf8')
 
+        // ── 打回清单：开发照着改，改完必须复审拿 pass ──
+        const rejectPath = join(genDir, 'review', `round-${round}-${verdict === 'reject' ? 'REJECT' : 'PASS'}.md`)
+        await writeFile(rejectPath, renderRejectionMarkdown({
+          round, reviewer, at, verdict,
+          items: items.map((it) => ({ id: it.id, severity: it.severity, text: it.text, box: it.box ?? null, location: it.location })),
+          annotatedImage,
+          staticPng: join(staticDir, 'index.png'),
+          rejected: verdict === 'reject',
+        }), 'utf8')
+
         const open = openItems(reviews)
         return [
-          `📥 已把专家整改清单接进第 ${round} 轮（${genDir}）`,
+          `${verdict === 'reject' ? '❌ 审计打回' : '✅ 审计通过'} · 已接进第 ${round} 轮（${genDir}）`,
           `- 评审人：${reviewer} · 条目：${items.length}（阻断 ${items.filter((i) => i.severity === 'blocker').length} / 主要 ${items.filter((i) => i.severity === 'major').length} / 次要 ${items.filter((i) => i.severity === 'minor').length}）`,
           `- 已注入：${promptPath}`,
           `- 评审记录：${join(genDir, 'review', `round-${round}.md`)}`,
-          `- 状态：${summarizeRounds(reviews)}`,
+          `- ${verdict === 'reject' ? '打回清单' : '通过记录'}：${rejectPath}`,
+          annotatedImage ? `- 标注图（问题已按 id 钉在基准图上）：${annotatedImage}` : '- 标注图：未生成（缺少 static/spec.json 或没有可解析的坐标）',
+          `- 审计对象：${scope} · 状态：${summarizeRounds(reviews)}`,
+          scope === 'baseline'
+            ? '✅ 已按流程约定把"设计基准已审计"记入 flow.json（confirmedVia=expert_review），无需人工再确认基准页。'
+            : '✅ 已记录实现审计；收尾门禁还要求：无未关闭整改项 + 至少一轮专家审计（本轮已满足）。',
           '',
           '解析结果（请核对，解析错了就用 items 传结构化 JSON 重来）：',
           ...items.slice(0, 20).map((it) => `  - [${it.id}/${it.severity}] ${it.text.slice(0, 90)}${it.location ? `  @${it.location}` : ''}`),
@@ -504,6 +598,11 @@ export function apply(ctx: Context, config: Config): void {
           '',
           `改完后关闭条目：figma_review_to_round(output_dir="${flowDir}", action="close", close="${items.slice(0, 3).map((i) => i.id).join(',')}", note="改在 xxx.tsx:123，实测 border-width=0 0 0 1px")`,
           `未关闭的 ${open.length} 条会让 figma_codegen_round 拒绝收尾。`,
+          verdict === 'reject'
+            ? '⚠️ 本轮判定为**打回**：blocker/major 全部关闭后，**还要再提审一轮**拿到 pass 才能收尾（开发自述改完不算通过）。'
+            : '本轮无 blocker/major；关闭剩余 minor 后即可收尾。',
+          '代码位置建议由主 agent 用行内标注（diff_approval_annotate）钉到对应行上，直接在代码里对话。',
+          '把标注图与打回清单一并交给开发（或直接贴进任务书）。',
         ].filter(Boolean).join('\n')
       },
     })))
@@ -622,8 +721,10 @@ export function apply(ctx: Context, config: Config): void {
           ...files.map((f) => `  - ${f}`),
           '',
           `下一步：按 CODEGEN_PROMPT.md 把占位换成**项目既有组件**、绝对定位收敛成 flex、色值映射主题令牌，`,
-          `然后做"组件渲染截图 ↔ ${args.static_page || join(outDir, 'static', 'index.html')} 基准页"对照；`,
-          `差异未清零前用 figma_codegen_round 继续迭代。`,
+          `然后渲染组件截图，与 ${args.static_page || join(outDir, 'static', 'index.html')} 基准页对照；`,
+          `**涉及 UI 就必须过一轮 UI 专家审计**（否则 figma_codegen_round 会拒绝收尾）：`,
+          `  summon_expert("UI 视觉验收设计师", 任务) → figma_review_to_round(output_dir="${outDir}", review=..., reviewer="UI 视觉验收设计师")`,
+          `  → 逐条改 → action="close" 关闭 → 再 figma_codegen_round。`,
         ].join('\n')
       },
     })))
@@ -649,10 +750,38 @@ export function apply(ctx: Context, config: Config): void {
         // 没人确认过基准就迭代，等于对着未确认的目标收敛。
         const found = await findFlow(dir)
         if (!args.force && found) {
+          // 【主流程】涉及 UI 的交付必须走过一轮 UI 专家审计
+          if (found.flow.expertReviewRequired !== false && !hasExpertReview(found.flow.reviews)) {
+            throw new Error([
+              '拒绝收尾：这个流程要求涉及 UI 的交付先经过一轮 **UI 专家审计**，但 flow.json 里还没有任何评审记录。',
+              '',
+              '照下面做（主 agent 负责叫专家；专家看不到你的上下文，**必须把路径原样抄进任务书**）：',
+              '  1) summon_expert("UI 视觉验收设计师", 任务) —— 任务里带：',
+              `     设计基准图 ${join(found.dir, 'static', 'index@2x.png')}（用 read_image 读图）`,
+              `     设计规格 ${join(found.dir, 'static', 'SPEC.md')}`,
+              '     组件实现截图（同尺寸/缩放）',
+              '     "逐条给出 问题/位置/期望/实际/级别(blocker|major|minor)"',
+              `  2) figma_review_to_round(output_dir="${found.dir}", review=<专家原文>, reviewer="UI 视觉验收设计师")`,
+              '  3) 按条目改 → action="close" 逐条关闭',
+              '',
+              '专家默认在 Agency 设置里关闭；确实没有专家可用时，可传 force=true 显式越过（会留痕在 flow.json 里）。',
+            ].join('\n'))
+          }
+          const rounds = found.flow.reviews ?? []
+          const last = rounds[rounds.length - 1]
+          if (last && last.verdict === 'reject') {
+            throw new Error([
+              `拒绝收尾：第 ${last.round} 轮 UI 专家审计的判定是 **reject（打回）**。`,
+              'blocker/major 修复并逐条关闭后，必须**再提审一轮**拿到 pass（复审），才允许收尾 —— 开发自述"改完了"不算通过。',
+              `复审：summon_expert("UI 视觉验收设计师", 带新的组件截图 + 基准图) → figma_review_to_round(...)`,
+              '确实要越过请显式传 force=true。',
+            ].join('\n'))
+          }
           const open = openItems(found.flow.reviews)
           if (open.length) {
+            const sev = openByeSeverity(found.flow.reviews)
             throw new Error([
-              `拒绝收尾：还有 ${open.length} 条专家整改项未关闭（${open.map((i) => `${i.id}[${i.severity}]`).join(', ')}）。`,
+              `拒绝收尾：还有 ${open.length} 条专家整改项未关闭（阻断 ${sev.blocker} / 主要 ${sev.major} / 次要 ${sev.minor}）。`,
               `用 figma_review_to_round(output_dir="${found.dir}", action="list") 看清单，`,
               `改完逐条关闭：action="close", close="${open.slice(0, 3).map((i) => i.id).join(',')}"。`,
               '确实要越过请显式传 force=true。',

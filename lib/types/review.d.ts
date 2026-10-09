@@ -21,6 +21,10 @@ export interface ReviewItem {
     location?: string;
     expected?: string;
     actual?: string;
+    /** 设计稿节点 id（如 132:8240）——用于在基准图上钉框 */
+    nodeId?: string;
+    /** 设计稿内坐标 [x,y,w,h]（由 nodeId 解析或直接给） */
+    box?: [number, number, number, number] | null;
 }
 export interface ReviewItemState extends ReviewItem {
     status: 'open' | 'closed';
@@ -33,6 +37,11 @@ export interface ReviewRoundState {
     reviewer: string;
     at: string;
     source?: string;
+    /** 审计对象：baseline（设计基准本身）| implementation（组件实现 vs 基准） */
+    scope?: 'baseline' | 'implementation';
+    /** 判定：有 blocker/major → reject（打回）；否则 pass */
+    verdict?: 'pass' | 'reject';
+    annotatedImage?: string;
     items: ReviewItemState[];
 }
 /**
@@ -41,6 +50,7 @@ export interface ReviewRoundState {
  */
 export declare function parseReview(text: string, opts?: {
     maxItems?: number;
+    resolveBox?: (nodeId: string) => [number, number, number, number] | null;
 }): ReviewItem[];
 /** 专家整改清单 → 追加进 CODEGEN_PROMPT.md 的轮次内容 */
 export declare function renderReviewRound(items: ReviewItem[], meta: {
@@ -53,3 +63,10 @@ export declare function renderReviewRound(items: ReviewItem[], meta: {
 /** 未关闭条目（收尾门禁用） */
 export declare function openItems(rounds: ReviewRoundState[] | undefined): ReviewItemState[];
 export declare function summarizeRounds(rounds: ReviewRoundState[] | undefined): string;
+/** 是否已经过至少一轮 UI 专家审计（主流程要求项） */
+export declare function hasExpertReview(rounds: ReviewRoundState[] | undefined): boolean;
+export declare function openByeSeverity(rounds: ReviewRoundState[] | undefined): {
+    blocker: number;
+    major: number;
+    minor: number;
+};

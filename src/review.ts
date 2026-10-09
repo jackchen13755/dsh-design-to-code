@@ -23,6 +23,10 @@ export interface ReviewItem {
   location?: string
   expected?: string
   actual?: string
+  /** 设计稿节点 id（如 132:8240）——用于在基准图上钉框 */
+  nodeId?: string
+  /** 设计稿内坐标 [x,y,w,h]（由 nodeId 解析或直接给） */
+  box?: [number, number, number, number] | null
 }
 
 export interface ReviewItemState extends ReviewItem {
@@ -37,6 +41,11 @@ export interface ReviewRoundState {
   reviewer: string
   at: string
   source?: string
+  /** 审计对象：baseline（设计基准本身）| implementation（组件实现 vs 基准） */
+  scope?: 'baseline' | 'implementation'
+  /** 判定：有 blocker/major → reject（打回）；否则 pass */
+  verdict?: 'pass' | 'reject'
+  annotatedImage?: string
   items: ReviewItemState[]
 }
 
@@ -85,7 +94,10 @@ function fromTableRow(row: string): string | undefined {
  * 解析专家整改清单。启发式但保守：只收"看起来是一条整改项"的行，
  * 且返回结果会原样回显给调用方核对。
  */
-export function parseReview(text: string, opts: { maxItems?: number } = {}): ReviewItem[] {
+export function parseReview(
+  text: string,
+  opts: { maxItems?: number; resolveBox?: (nodeId: string) => [number, number, number, number] | null } = {},
+): ReviewItem[] {
   const maxItems = opts.maxItems ?? 80
   const out: ReviewItem[] = []
   const seen = new Set<string>()
@@ -98,6 +110,9 @@ export function parseReview(text: string, opts: { maxItems?: number } = {}): Rev
     if (seen.has(key)) return
     seen.add(key)
     const sev = severityOf(raw)
+    // 正文里出现的 "132:8240" 这种节点 id，自动认领 → 能在基准图上钉框
+    const nodeMatch = raw.match(/(\d{1,6}:\d{1,6})/)
+    const nodeId = nodeMatch ? nodeMatch[1] : undefined
     const item: ReviewItem = {
       id: '',
       severity: sev,
@@ -105,6 +120,8 @@ export function parseReview(text: string, opts: { maxItems?: number } = {}): Rev
       location: locationOf(raw),
       expected: extra?.expected,
       actual: extra?.actual,
+      nodeId,
+      box: nodeId && opts.resolveBox ? opts.resolveBox(nodeId) : undefined,
     }
     out.push(item)
   }
@@ -181,4 +198,18 @@ export function summarizeRounds(rounds: ReviewRoundState[] | undefined): string 
   const all = rounds.flatMap((r) => r.items)
   const open = all.filter((i) => i.status === 'open')
   return `${rounds.length} 轮评审 / 共 ${all.length} 条 / 未关闭 ${open.length} 条`
+}
+
+/** 是否已经过至少一轮 UI 专家审计（主流程要求项） */
+export function hasExpertReview(rounds: ReviewRoundState[] | undefined): boolean {
+  return (rounds ?? []).some((r) => r.items.length > 0)
+}
+
+export function openByeSeverity(rounds: ReviewRoundState[] | undefined): { blocker: number; major: number; minor: number } {
+  const open = openItems(rounds)
+  return {
+    blocker: open.filter((i) => i.severity === 'blocker').length,
+    major: open.filter((i) => i.severity === 'major').length,
+    minor: open.filter((i) => i.severity === 'minor').length,
+  }
 }

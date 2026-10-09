@@ -241,7 +241,7 @@ export function renderSpecMarkdown(model: DesignModel, ds: Ds, projectName?: str
   return L.join('\n')
 }
 
-export function renderStatic(model: DesignModel, opts: StaticRenderOptions): { htmlPath: string; specPath?: string; stats: { nodes: number; rules: number; instances: number } } {
+export function renderStatic(model: DesignModel, opts: StaticRenderOptions): { htmlPath: string; specPath?: string; specJsonPath: string; stats: { nodes: number; rules: number; instances: number } } {
   const ds = inferDesignSystem(model)
   const outDir = resolve(opts.outputDir)
   mkdirSync(outDir, { recursive: true })
@@ -295,13 +295,20 @@ window.addEventListener('load', function () {
   const htmlPath = join(outDir, 'index.html')
   writeFileSync(htmlPath, html, 'utf8')
 
+  // 机器可读规格：审计环节用它把"设计稿节点 id"解析成基准图上的坐标，从而把问题钉在图上
+  writeFileSync(join(outDir, 'spec.json'), JSON.stringify({
+    nodeId: model.nodeId, fileKey: model.fileKey,
+    width: model.width, height: model.height,
+    rows: model.spec,
+  }, null, 2), 'utf8')
+
   let specPath: string | undefined
   if (opts.spec !== false) {
     specPath = join(outDir, 'SPEC.md')
     writeFileSync(specPath, renderSpecMarkdown(model, ds, opts.projectName), 'utf8')
   }
 
-  return { htmlPath, specPath, stats: { nodes: nodes.length, rules: css.length, instances } }
+  return { htmlPath, specPath, specJsonPath: join(outDir, 'spec.json'), stats: { nodes: nodes.length, rules: css.length, instances } }
 }
 
 /** 供 codegen 复用的摘要行（把规格表塞进 Codegen Prompt） */
