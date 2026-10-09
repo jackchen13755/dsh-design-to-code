@@ -18,6 +18,8 @@ DSH 工具：**设计稿 → 可核对的视觉基准 / 审计清单 / 代码骨
 | `figma_change_brief` | **需求是"在现有页面上改几处"** | 新稿 → 静态基准页 + **旧稿 vs 新稿的逐字段设计差异** + 在目标仓库里 grep 出的**代码落点候选** + 逐条变更计划模板 `CHANGE.md` |
 | `figma_audit_node` | 新建 | 实现前核对清单（逐边描边/逐角圆角/字体/auto-layout）；把「真歧义（要问设计）」与「数据缺失（按兜底规则做）」分开 |
 | `figma_gen_component` | 新建 | 设计 + 需求 → React/TS/CSS Modules **几何骨架** + Codegen Prompt（实例渲染为语义占位并带 `data-design-name` 供替换为项目组件） |
+| `figma_confirm_static` | 人工确认 | 记录"用户已确认基准页"（确认人/时间/备注/已知差异，可 reset）；未确认时收尾会被拒 |
+| `figma_review_to_round` | **专家整改清单** | 把 UI 专家/验收专家的清单解析成结构化条目 → 注入下一轮 `CODEGEN_PROMPT.md` → 逐条记 open/closed；**未关闭项不允许收尾** |
 | `figma_codegen_round` | 新建，第 2+ 轮 | 在已有输出上追加下一轮差异指令，迭代到差异清零 |
 
 ### 两条推荐流程
@@ -97,6 +99,8 @@ output_dir/
 
 ## 变更记录
 
+- **0.1.1**：流程硬门禁（缺基准页拒生成、未确认/有未关闭整改项拒收尾）+ `figma_confirm_static`
+  人工确认状态（`flow.json`）+ `figma_review_to_round`（专家整改清单闭环）。
 - **0.1.0**：新增 `figma_render_static`（视觉基准）与 `figma_change_brief`（改现有页面）；
   修正 DesignModel 的坐标/逐边描边/逐角圆角/实例文案/auto-layout；审计歧义判据重写（259 误报 → 0）；
   骨架修掉"渲染成空白"、文字样式丢失、实例图层名当正文三个致命缺陷。

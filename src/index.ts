@@ -10,6 +10,10 @@ import { generateCode, summarizeAudit } from './codegen.js'
 import { auditModel, auditToMarkdown } from './audit.js'
 import { renderStatic } from './render-static.js'
 import { findCodeHits, keywordsOf, renderChangeMarkdown } from './diff.js'
+import {
+  openItems, parseReview, renderReviewRound, summarizeRounds,
+  type ReviewItem, type ReviewItemState, type ReviewRoundState,
+} from './review.js'
 
 export const name = '@deepseek-ai/dsh-tool-design-to-code'
 export const inject = ['tools']
@@ -82,6 +86,8 @@ interface FlowState {
   confirmedBy?: string
   confirmedAt?: string
   confirmNote?: string
+  /** 专家整改清单的轮次记录（figma_review_to_round 维护） */
+  reviews?: ReviewRoundState[]
   updatedAt: string
 }
 
@@ -110,6 +116,37 @@ async function writeFlow(outDir: string, patch: Partial<FlowState> & Pick<FlowSt
   const next: FlowState = { ...(prev ?? {} as FlowState), ...patch, updatedAt: new Date().toISOString() }
   await writeFile(join(outDir, 'flow.json'), JSON.stringify(next, null, 2), 'utf8')
   return next
+}
+
+/** 轮次游标（.codegen-round）：figma_codegen_round 与 figma_review_to_round 共用 */
+async function readRound(dir: string): Promise<number> {
+  try { return Number(await readFile(join(dir, '.codegen-round'), 'utf8')) || 1 } catch { return 1 }
+}
+
+/** 找"生成目录"（含 CODEGEN_PROMPT.md 的那层）：调用方可能给 outDir 或 outDir/gen */
+async function findGenDir(dir: string): Promise<string | null> {
+  for (const cand of [dir, join(dir, 'gen'), resolve(dir, '..'), join(resolve(dir, '..'), 'gen')]) {
+    if (existsSync(join(cand, 'CODEGEN_PROMPT.md'))) return cand
+  }
+  return null
+}
+
+function parseItemsJson(raw?: string): ReviewItem[] | null {
+  if (!raw) return null
+  try {
+    const arr = JSON.parse(raw)
+    if (!Array.isArray(arr)) return null
+    return arr.map((it: any, i: number) => ({
+      id: String(it.id ?? `R${i + 1}`),
+      severity: (['blocker', 'major', 'minor', 'info'].includes(String(it.severity)) ? String(it.severity) : 'info') as ReviewItem['severity'],
+      text: String(it.text ?? it.issue ?? it.description ?? '').slice(0, 400),
+      location: it.location ? String(it.location) : undefined,
+      expected: it.expected ? String(it.expected) : undefined,
+      actual: it.actual ? String(it.actual) : undefined,
+    })).filter((it) => it.text)
+  } catch {
+    return null
+  }
 }
 
 interface NodeInput {
@@ -313,6 +350,139 @@ export function apply(ctx: Context, config: Config): void {
       },
     })))
 
+    // ── 工具 0d：专家整改清单 → 下一轮任务（把"人味判断"接进闭环） ──
+    disposers.push(ctx.tools.register(defineTool({
+      name: 'figma_review_to_round',
+      description: '把 UI 专家/验收专家的整改清单接进迭代闭环：解析成结构化条目 → 注入 CODEGEN_PROMPT.md 的下一轮 → 在 flow.json 里逐条记 open/closed。未关闭条目会让 figma_codegen_round 拒绝收尾。action=add 追加评审 / list 查看 / close 关闭条目',
+      parameters: {
+        output_dir: { type: 'string', description: '输出目录（figma_gen_component 的 output_dir 或其 gen 子目录）' },
+        action: { type: 'string', description: 'add（默认，追加评审）/ list（查看当前条目状态）/ close（关闭条目）' },
+        review: { type: 'string', description: 'add：专家整改清单原文（markdown/列表/表格都行，启发式解析）' },
+        items: { type: 'string', description: 'add：显式结构化条目（JSON 数组，优先于 review 解析），如 [{"severity":"major","text":"锚点项应为只有左边框","location":"less/index.less:48"}]' },
+        reviewer: { type: 'string', description: 'add：评审人（如 "UI 视觉验收设计师"）' },
+        source: { type: 'string', description: 'add：来源（文件路径或说明）' },
+        close: { type: 'string', description: 'close：要关闭的条目 id（逗号分隔，如 R1,R3）；也可写 all' },
+        closed_by: { type: 'string', description: 'close：关闭人' },
+        note: { type: 'string', description: 'close：关闭说明（改在哪个文件哪一行、实测值）' },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_args: unknown, value: unknown) => [textBlock(String(value))],
+      },
+      async execute(args: {
+        output_dir: string; action?: string; review?: string; items?: string
+        reviewer?: string; source?: string; close?: string; closed_by?: string; note?: string
+      }) {
+        const start = resolve(args.output_dir)
+        const action = args.action || 'add'
+        const found = await findFlow(start)
+        const genDir = await findGenDir(start)
+        const flowDir = found?.dir ?? (genDir ? resolve(genDir, '..') : start)
+
+        // ── list ──
+        if (action === 'list') {
+          if (!found?.flow.reviews?.length) return `（${flowDir}/flow.json 里还没有专家评审记录）`
+          const L = [`📋 专家评审状态（${flowDir}）：${summarizeRounds(found.flow.reviews)}`, '']
+          L.push('| id | 轮次 | 级别 | 状态 | 问题 | 位置 |')
+          L.push('|---|---|---|---|---|---|')
+          for (const r of found.flow.reviews) {
+            for (const it of r.items) {
+              L.push(`| ${it.id} | ${r.round} | ${it.severity} | ${it.status === 'open' ? '🔴 open' : '✅ closed'} | ${it.text.replace(/\|/g, '\\|').slice(0, 120)} | ${it.location ?? ''} |`)
+            }
+          }
+          const open = openItems(found.flow.reviews)
+          L.push('')
+          L.push(open.length ? `⚠️ 还有 ${open.length} 条未关闭：${open.map((i) => i.id).join(', ')}` : '✅ 全部已关闭')
+          return L.join('\n')
+        }
+
+        // ── close ──
+        if (action === 'close') {
+          if (!found?.flow.reviews?.length) throw new Error('还没有专家评审记录，先 action=add')
+          const wanted = String(args.close || '').trim()
+          const all = found.flow.reviews.flatMap((r) => r.items)
+          const ids = wanted === 'all' ? all.filter((i) => i.status === 'open').map((i) => i.id)
+            : wanted.split(',').map((x) => x.trim()).filter(Boolean)
+          if (!ids.length) throw new Error('close 需要指定条目 id（逗号分隔）或 all')
+          const unknown = ids.filter((id) => !all.some((i) => i.id === id))
+          if (unknown.length) throw new Error(`找不到条目：${unknown.join(', ')}（可用 action=list 查看）`)
+          const now = new Date().toISOString()
+          for (const r of found.flow.reviews) {
+            for (const it of r.items) {
+              if (ids.includes(it.id) && it.status === 'open') {
+                it.status = 'closed'; it.closedBy = args.closed_by || 'agent'; it.closedAt = now
+                it.closedNote = args.note || undefined
+              }
+            }
+          }
+          await writeFlow(flowDir, { ...found.flow, reviews: found.flow.reviews })
+          const rest = openItems(found.flow.reviews)
+          return [
+            `✅ 已关闭 ${ids.length} 条（${ids.join(', ')}）`,
+            rest.length ? `⚠️ 仍有 ${rest.length} 条未关闭：${rest.map((i) => i.id).join(', ')}` : '✅ 全部整改项已关闭',
+          ].join('\n')
+        }
+
+        // ── add ──
+        if (!genDir) throw new Error(`找不到 CODEGEN_PROMPT.md（在 ${start} 及其 gen/ 下都没有）：先跑 figma_gen_component`)
+        const explicit = parseItemsJson(args.items)
+        const items: ReviewItem[] = explicit ?? parseReview(String(args.review ?? ''))
+        if (!items.length) {
+          throw new Error('没能从 review 里解析出任何条目。请把清单写成列表/表格，或用 items 传结构化 JSON（JSON.parse 后的数组）')
+        }
+        const round = (await readRound(genDir)) + 1
+        const at = new Date().toISOString()
+        const reviewer = args.reviewer || 'expert'
+        const block = renderReviewRound(items, { round, reviewer, at, source: args.source, extra: args.review })
+        const promptPath = join(genDir, 'CODEGEN_PROMPT.md')
+        await writeFile(promptPath, `${await readFile(promptPath, 'utf8')}\n${block}`, 'utf8')
+        await writeFile(join(genDir, '.codegen-round'), String(round), 'utf8')
+
+        const state: ReviewItemState[] = items.map((it) => ({ ...it, status: 'open' }))
+        const reviews = [...(found?.flow.reviews ?? []), { round, reviewer, at, source: args.source, items: state } as ReviewRoundState]
+        await writeFlow(flowDir, {
+          stage: found?.flow.stage ?? 'skeleton_generated',
+          nodeId: found?.flow.nodeId ?? '',
+          fileKey: found?.flow.fileKey ?? '',
+          reviews,
+        })
+
+        // 落一份人可读的评审记录
+        await mkdir(join(genDir, 'review'), { recursive: true })
+        await writeFile(join(genDir, 'review', `round-${round}.md`), [
+          `# 第 ${round} 轮专家整改清单`,
+          '',
+          `- 评审人：${reviewer} · 时间：${at}${args.source ? ` · 来源：${args.source}` : ''}`,
+          '',
+          '| id | 级别 | 问题 | 位置 | 期望 | 实际 |',
+          '|---|---|---|---|---|---|',
+          ...items.map((it) => `| ${it.id} | ${it.severity} | ${it.text.replace(/\|/g, '\\|')} | ${it.location ?? ''} | ${it.expected ?? ''} | ${it.actual ?? ''} |`),
+          '',
+          '---',
+          '',
+          '## 评审原文',
+          '',
+          String(args.review ?? '（未提供原文，来自 items 结构化输入）'),
+        ].join('\n'), 'utf8')
+
+        const open = openItems(reviews)
+        return [
+          `📥 已把专家整改清单接进第 ${round} 轮（${genDir}）`,
+          `- 评审人：${reviewer} · 条目：${items.length}（阻断 ${items.filter((i) => i.severity === 'blocker').length} / 主要 ${items.filter((i) => i.severity === 'major').length} / 次要 ${items.filter((i) => i.severity === 'minor').length}）`,
+          `- 已注入：${promptPath}`,
+          `- 评审记录：${join(genDir, 'review', `round-${round}.md`)}`,
+          `- 状态：${summarizeRounds(reviews)}`,
+          '',
+          '解析结果（请核对，解析错了就用 items 传结构化 JSON 重来）：',
+          ...items.slice(0, 20).map((it) => `  - [${it.id}/${it.severity}] ${it.text.slice(0, 90)}${it.location ? `  @${it.location}` : ''}`),
+          items.length > 20 ? `  - …共 ${items.length} 条` : '',
+          '',
+          `改完后关闭条目：figma_review_to_round(output_dir="${flowDir}", action="close", close="${items.slice(0, 3).map((i) => i.id).join(',')}", note="改在 xxx.tsx:123，实测 border-width=0 0 0 1px")`,
+          `未关闭的 ${open.length} 条会让 figma_codegen_round 拒绝收尾。`,
+        ].filter(Boolean).join('\n')
+      },
+    })))
+
     // ── 工具 1：设计审计 ──
     disposers.push(ctx.tools.register(defineTool({
       name: 'figma_audit_node',
@@ -436,7 +606,7 @@ export function apply(ctx: Context, config: Config): void {
     // ── 工具 3：多轮迭代 ──
     disposers.push(ctx.tools.register(defineTool({
       name: 'figma_codegen_round',
-      description: '【流程硬约束】收尾迭代：若 flow.json 里 confirmed 不为 true，本工具会拒绝（需先 figma_confirm_static，或用 force=true 显式越过）。多轮代码生成迭代：在已有输出目录上追加下一轮指令（基于上一轮 review/截图差异），更新 CODEGEN_PROMPT.md 与 round 记录',
+      description: '【流程硬约束】收尾迭代：若 flow.json 里 confirmed 不为 true、或还有未关闭的专家整改项，本工具会拒绝（需先 figma_confirm_static，或用 force=true 显式越过）。多轮代码生成迭代：在已有输出目录上追加下一轮指令（基于上一轮 review/截图差异），更新 CODEGEN_PROMPT.md 与 round 记录',
       parameters: {
         output_dir: { type: 'string', description: '已有输出目录（figma_gen_component 的 output_dir）' },
         round_feedback: { type: 'string', description: '本轮 review/差异/截图对照结论（必填）' },
@@ -453,6 +623,17 @@ export function apply(ctx: Context, config: Config): void {
         // 【硬门禁】收尾迭代要求基准页已经人工确认过：迭代是"声称做完"的前一步，
         // 没人确认过基准就迭代，等于对着未确认的目标收敛。
         const found = await findFlow(dir)
+        if (!args.force && found) {
+          const open = openItems(found.flow.reviews)
+          if (open.length) {
+            throw new Error([
+              `拒绝收尾：还有 ${open.length} 条专家整改项未关闭（${open.map((i) => `${i.id}[${i.severity}]`).join(', ')}）。`,
+              `用 figma_review_to_round(output_dir="${found.dir}", action="list") 看清单，`,
+              `改完逐条关闭：action="close", close="${open.slice(0, 3).map((i) => i.id).join(',')}"。`,
+              '确实要越过请显式传 force=true。',
+            ].join('\n'))
+          }
+        }
         if (!args.force && found && !found.flow.confirmed) {
           throw new Error([
             `拒绝迭代：${join(found.dir, 'flow.json')} 里 confirmed=false（基准页还没有人工确认）。`,
