@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-tool-design-to-code",
-  "version": "0.0.2",
-  "description": "设计稿 + 需求 → 符合项目约定的 React/TS 高质量代码生成器（无外部依赖）",
+  "version": "0.1.0",
+  "description": "设计稿 → 1:1 静态还原页 / 审计清单 / 几何骨架 / 变更简报（改现有页面）—— 零外部依赖、零 REST",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/types/index.d.ts",

@@ -1,23 +1,34 @@
 /**
- * 代码生成器：DesignModel + 选项 → React/TS/CSS Modules 文件（无外部依赖）。
+ * 代码生成器：DesignModel + 选项 → React/TS/CSS Modules 骨架 + Codegen Prompt。
  *
- * 生成的是“设计准确的骨架 + 交互挂载点”：布局/令牌/文本来自设计数据（确定性），
- * 业务交互由 `CODEGEN_PROMPT.md` 引导会话 LLM 按需求补全。
+ * 定位没变：生成"**设计准确的骨架 + 交互挂载点**"，业务交互由 CODEGEN_PROMPT.md 引导会话 LLM 补全。
+ * 但这一版修掉了三个让骨架不可用的缺陷：
+ * 1. **坐标**：上一版把根节点的画布坐标（6119/4653）也累加进子节点，而根容器只有 1440×2318
+ *    且 overflow:hidden → 整个组件渲染成**空白**。现在用 DesignModel 里"根节点归零"的绝对坐标，
+ *    并**扁平渲染**（不再嵌套，避免相对/绝对混用再次叠加偏移）。
+ * 2. **文字样式**：上一版只写 color，tokens 里收的 12/13/14/16px 全丢，浏览器按默认 16px 渲染。
+ *    现在字号/字重/字体族/行高/字距/对齐全部落到 span。
+ * 3. **实例**：上一版把实例的**图层名**当正文渲染（实测 89 处会出现 Input、Select、*、Hand 字面量）。
+ *    现在实例渲染成语义占位元素（input/select/button/radio…），文案取覆写链，
+ *    并带 data-design-name 供会话 LLM 用项目组件替换。
  */
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import type { DesignModel, DesignNode } from './design.js'
+import { inferDesignSystem, specTable } from './render-static.js'
+import type { AuditResult } from './audit.js'
 
 export interface CodegenOptions {
   componentName: string
   requirements: string
   conventions: string
   outputDir: string
-  /** figma_audit_node 生成的核对清单 markdown（内联进 Codegen Prompt） */
+  /** 审计清单 markdown（内联进 Codegen Prompt） */
   auditMd?: string
-  /** 当前轮次（多轮生成） */
+  /** 静态还原页路径（视觉基准，写进 Prompt 让人/LLM 去对照） */
+  staticPagePath?: string
+  /** 当前轮次 */
   round?: number
-  /** 上一轮反馈（round>1 时） */
   roundFeedback?: string
 }
 
@@ -26,252 +37,232 @@ function safeName(name: string): string {
   return cleaned || 'DesignComponent'
 }
 
-function collectFlat(nodes: DesignNode[], out: DesignNode[] = []): DesignNode[] {
-  for (const n of nodes) {
-    out.push(n)
-    collectFlat(n.children, out)
+function flat(nodes: DesignNode[]): DesignNode[] {
+  const out: DesignNode[] = []
+  const walk = (n: DesignNode): void => {
+    if (n.raw.visible === false) return
+    if (n.kind !== 'root') out.push(n)
+    for (const c of n.children) walk(c)
   }
+  for (const n of nodes) walk(n)
   return out
 }
 
-const ACTION_RE = /复制|制新卡|取消|确定|保存|提交|关闭|confirm|ok|cancel/i
+const escText = (s: unknown): string =>
+  String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+const escAttr = (s: unknown): string =>
+  String(s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;')
 
-function descendantText(n: DesignNode, re: RegExp): string | undefined {
-  if (n.kind === 'text' && n.value && re.test(n.value)) return n.value
-  for (const c of n.children) {
-    const v = descendantText(c, re)
-    if (v) return v
+interface InstKindRule { re: RegExp; tag: string }
+const INSTANCE_RULES: InstKindRule[] = [
+  { re: /hand|cursor|光标/i, tag: 'skip' },
+  { re: /^\*$/, tag: 'required' },
+  { re: /radio|单选框/i, tag: 'radio' },
+  { re: /delete|trash|删除/i, tag: 'icon' },
+  { re: /tag|标签/i, tag: 'tag' },
+  { re: /upload|上传/i, tag: 'upload' },
+  { re: /date|calendar|日期/i, tag: 'date' },
+  { re: /select|dropdown|下拉|combo/i, tag: 'select' },
+  { re: /button|btn|按钮/i, tag: 'button' },
+  { re: /input|输入/i, tag: 'input' },
+]
+function instanceTag(n: DesignNode): string {
+  for (const r of INSTANCE_RULES) if (r.re.test(n.name)) return r.tag
+  return 'placeholder'
+}
+
+/** 单节点 → CSS 声明（几何/逐边描边/逐角圆角/阴影/字体） */
+function cssDecl(n: DesignNode): string {
+  const d: string[] = [
+    'position: absolute',
+    `left: ${n.x}px`,
+    `top: ${n.y}px`,
+    `width: ${n.w}px`,
+    `height: ${n.h}px`,
+    'box-sizing: border-box',
+  ]
+  if (n.background && n.kind !== 'text') d.push(`background: ${n.background}`)
+  if (n.border) {
+    d.push('border-style: solid', `border-color: ${n.border.color}`)
+    d.push(`border-width: ${n.border.top}px ${n.border.right}px ${n.border.bottom}px ${n.border.left}px`)
   }
-  return undefined
-}
-
-/** 输入框默认值：同行的右侧文本（如 2 / 2026-01-01 周一 / 16:00）。 */
-function rowValue(n: DesignNode, flat: DesignNode[]): string | undefined {
-  const cands = flat
-    .filter((t) => t.kind === 'text' && t.value)
-    .filter((t) => Math.abs(t.y - n.y) <= 14 && t.x >= n.x + 10)
-    .sort((a, b) => a.x - b.x)
-  return cands[0]?.value
-}
-
-function escapeText(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-}
-function escapeAttr(s: string): string {
-  return s.replace(/"/g, '&quot;').replace(/&/g, '&amp;')
-}
-
-/** 节点边框：strokePaints + strokeWeight + dashPattern（虚线坑：用 dashPattern 不是 strokeDashes）。 */
-function strokeCss(n: DesignNode): string | undefined {
-  const r = n.raw
-  const sp = Array.isArray(r.strokePaints) ? r.strokePaints.find((p: any) => p.visible !== false && p.color) : undefined
-  if (!sp?.color) return undefined
-  const c = sp.color
-  const a = sp.opacity ?? c.a ?? 1
-  const color = `rgba(${Math.round((c.r ?? 0) * 255)},${Math.round((c.g ?? 0) * 255)},${Math.round((c.b ?? 0) * 255)},${a})`
-  const w = typeof r.strokeWeight === 'number' ? r.strokeWeight : 1
-  const dash = Array.isArray(r.dashPattern) && r.dashPattern.length ? 'dashed' : 'solid'
-  return `${w}px ${dash} ${color}`
-}
-
-/** 节点阴影：effects（含 visible）。 */
-function shadowCss(n: DesignNode): string | undefined {
-  const r = n.raw
-  const e = (r.effects ?? []).find((x: any) => x && x.visible !== false && (x.type === 'DROP_SHADOW' || x.type === 'INNER_SHADOW'))
-  if (!e) return undefined
-  const c = e.color ?? {}
-  const a = e.opacity ?? c.a ?? 1
-  const inset = e.type === 'INNER_SHADOW' ? ' inset' : ''
-  return `${e.offset?.x ?? 0}px ${e.offset?.y ?? 0}px ${e.radius ?? 0}px ${e.spread ?? 0}px rgba(${Math.round((c.r ?? 0) * 255)},${Math.round((c.g ?? 0) * 255)},${Math.round((c.b ?? 0) * 255)},${a})${inset}`.trim()
-}
-
-function baseStyle(n: DesignNode): string {
-  const parts: string[] = [`left: ${n.x}`, `top: ${n.y}`, `width: ${n.w}`, `height: ${n.h}`]
-  if (n.background) parts.push(`background: '${n.background}'`)
-  const border = strokeCss(n)
-  if (border) parts.push(`border: '${border}'`)
-  const shadow = shadowCss(n)
-  if (shadow) parts.push(`boxShadow: '${shadow}'`)
-  return `{ ${parts.join(', ')} }`
-}
-
-function renderNode(n: DesignNode, flat: DesignNode[], index: number): string {
-  const style = baseStyle(n)
-  const pos = `style={${style}}`
-  switch (n.kind) {
-    case 'text': {
-      const color = n.color ? `, color: '${n.color}'` : ''
-      return `      <span className={styles.text} style={{ left: ${n.x}, top: ${n.y}, width: ${n.w}, height: ${n.h}${color} }}>${escapeText(n.value ?? n.name)}</span>`
-    }
-    case 'input': {
-      const def = rowValue(n, flat) ?? ''
-      const label = (n.name || 'input').replace(/"/g, '\\"')
-      return `      <input className={styles.input} ${pos} defaultValue="${escapeAttr(def)}" aria-label="${escapeAttr(label)}" data-key="${escapeAttr(label)}" onChange={(e) => handleChange("${escapeAttr(label)}", e.target.value)} />`
-    }
-    case 'button': {
-      const label = descendantText(n, ACTION_RE) ?? n.name
-      return `      <button className={styles.button} ${pos} onClick={() => onAction?.("${escapeAttr(label)}", data)}>${escapeText(label)}</button>`
-    }
-    case 'icon-close':
-      return `      <button className={styles.close} ${pos} aria-label="关闭" onClick={onClose}>×</button>`
-    case 'frame':
-    case 'root':
-    case 'instance':
-    default:
-      return `      <div className={styles.${n.kind === 'root' ? 'root' : 'frame'}} ${pos}>${n.kind === 'instance' ? escapeText(n.name) : ''}</div>`
+  if (n.radius) d.push(`border-radius: ${n.radius}`)
+  if (n.shadow) d.push(`box-shadow: ${n.shadow}`)
+  if (n.opacity != null) d.push(`opacity: ${n.opacity}`)
+  if (n.kind === 'text' && n.text) {
+    d.push(`font-family: '${n.text.family}', system-ui, sans-serif`)
+    d.push(`font-size: ${n.text.size}px`, `font-weight: ${n.text.weight}`)
+    if (n.text.lineHeight) d.push(`line-height: ${n.text.lineHeight}`)
+    if (n.text.letterSpacing) d.push(`letter-spacing: ${n.text.letterSpacing}`)
+    if (n.text.align) d.push(`text-align: ${n.text.align}`)
+    if (n.text.color) d.push(`color: ${n.text.color}`)
+    d.push('white-space: pre', 'overflow: visible')
   }
+  return d.join(';\n  ')
 }
 
 export function generateCode(model: DesignModel, opts: CodegenOptions): string[] {
   const name = safeName(opts.componentName)
-  const flat = collectFlat([model.tree]).filter((n) => n.kind !== 'root')
+  const ds = inferDesignSystem(model)
+  const nodes = flat([model.tree])
   const outDir = resolve(opts.outputDir)
   mkdirSync(join(outDir, 'src'), { recursive: true })
 
   // ── tokens.ts ──
-  const colors = Object.entries(model.tokens.colors)
-    .map(([k, v]) => `  '${k}': '${v}',`)
-    .join('\n')
+  const colors = Object.entries(model.tokens.colors).map(([k, v]) => `  '${k}': '${v}',`).join('\n')
   const fonts = Object.entries(model.tokens.fonts)
-    .map(
-      ([k, v]) =>
-        `  '${k}': { family: '${v.family}', weight: '${v.weight}', size: ${v.size}${v.lineHeight ? `, lineHeight: '${v.lineHeight}'` : ''}${v.letterSpacing ? `, letterSpacing: '${v.letterSpacing}'` : ''} },`,
-    )
+    .map(([k, v]) => `  '${k}': { family: '${v.family}', weight: '${v.weight}', size: ${v.size}${v.lineHeight ? `, lineHeight: '${v.lineHeight}'` : ''}${v.letterSpacing ? `, letterSpacing: '${v.letterSpacing}'` : ''} },`)
     .join('\n')
   writeFileSync(
     join(outDir, 'src', 'tokens.ts'),
-    `// 由设计稿自动生成的设计令牌（dsh-design-to-code）\n\nexport const designTokens = {\n  colors: {\n${colors}\n  },\n  fonts: {\n${fonts}\n  },\n  spacing: [${model.tokens.spacing.join(', ')}],\n  shadows: [${model.tokens.shadows.map((s) => `'${s}'`).join(', ')}],\n};\n`,
+    `// 由设计稿自动生成的设计令牌（dsh-design-to-code）\n// 注意：这里的色值是**设计稿 literal 值**，落项目时要映射到项目主题令牌（见 SPEC.md 第 2 节）。\n\nexport const designTokens = {\n  colors: {\n${colors}\n  },\n  fonts: {\n${fonts}\n  },\n  spacing: [${model.tokens.spacing.join(', ')}],\n  shadows: [${model.tokens.shadows.map((s) => `'${s}'`).join(', ')}],\n  /** 从设计数据投票得出的设计系统常量（用于重建实例占位） */\n  inferred: {\n    line: '${ds.line}',\n    text: '${ds.text}',\n    placeholder: '${ds.placeholder}',\n    primary: '${ds.primary}',\n    radius: ${ds.radius},\n    controlHeight: ${ds.controlH},\n  },\n};\n`,
     'utf8',
   )
 
   // ── types.ts ──
   writeFileSync(
     join(outDir, 'src', 'types.ts'),
-    `// 组件契约（骨架版）：业务语义由需求 → CODEGEN_PROMPT.md 补全\n\nexport interface ${name}Props {\n  /** 初始表单值，key 为设计稿控件标签 */\n  initialData?: Record<string, string>;\n  /** 按钮动作：action 为按钮文本，data 为当前表单值 */\n  onAction?: (action: string, data: Record<string, string>) => void;\n  /** 关闭 */\n  onClose?: () => void;\n}\n`,
+    `// 组件契约（骨架版）：业务语义由需求 → CODEGEN_PROMPT.md 补全\n\nexport interface ${name}Props {\n  /** 初始表单值，key 用 data-design-name（设计稿控件名） */\n  initialData?: Record<string, string>;\n  onAction?: (action: string, data: Record<string, string>) => void;\n  onClose?: () => void;\n}\n`,
     'utf8',
   )
 
-  // ── Component.tsx ──
-  const body = flat.map((n, i) => renderNode(n, flat, i)).join('\n')
+  // ── 组件 + CSS ──
+  const cssRules: string[] = ['.root {\n  position: relative;\n  overflow: hidden;\n}']
+  const jsx: string[] = []
+  const instanceTodo: string[] = []
+
+  nodes.forEach((n, i) => {
+    const cls = `n${i}`
+    cssRules.push(`.${cls} {\n  ${cssDecl(n)}\n}`)
+    if (n.type === 'INSTANCE') {
+      const tag = instanceTag(n)
+      if (tag === 'skip') return
+      const designName = escAttr(`${n.name} ${n.w}x${n.h}`)
+      instanceTodo.push(`- ${n.id} \`${n.name}\` ${n.w}×${n.h} @(${n.x},${n.y})${n.value ? ` 文案「${n.value}」` : ''}`)
+      switch (tag) {
+        case 'input':
+        case 'select':
+        case 'date':
+          jsx.push(`      <div className={styles.${cls}} data-design-name="${designName}"><input className={styles.instInput} defaultValue="${escAttr(n.value ?? '')}" aria-label="${escAttr(n.name)}" /></div>`)
+          return
+        case 'button':
+          cssRules.push(`.${cls} {\n  display: flex;\n  align-items: center;\n  justify-content: center;\n}`)
+          jsx.push(`      <button type="button" className={styles.${cls}} data-design-name="${designName}" onClick={() => onAction?.('${escAttr(n.value ?? n.name)}', data)}>${escText(n.value ?? n.name)}</button>`)
+          return
+        case 'radio':
+          jsx.push(`      <input type="radio" className={styles.${cls}} data-design-name="${designName}" name="design-radio-${i}" />`)
+          return
+        case 'required':
+          cssRules.push(`.${cls} {\n  color: #e64545;\n}`)
+          jsx.push(`      <span className={styles.${cls}} aria-hidden="true">*</span>`)
+          return
+        case 'tag':
+        case 'upload':
+          jsx.push(`      <span className={styles.${cls}} data-design-name="${designName}">${escText(n.value ?? n.name)}</span>`)
+          return
+        default:
+          jsx.push(`      <div className={styles.${cls}} data-design-name="${designName}" />`)
+          return
+      }
+    }
+    if (n.kind === 'text') {
+      jsx.push(`      <span className={styles.${cls}}>${escText(n.value ?? '')}</span>`)
+      return
+    }
+    if (n.kind === 'icon') {
+      jsx.push(`      {/* 图标占位：设计数据里没有矢量路径，请用项目图标组件替换 */}\n      <div className={styles.${cls}} aria-hidden="true" />`)
+      return
+    }
+    jsx.push(`      <div className={styles.${cls}} />`)
+  })
+
+  cssRules.push(`.instInput {\n  width: 100%;\n  height: 100%;\n  box-sizing: border-box;\n  border: 0;\n  outline: 0;\n  padding: 0 12px;\n  background: transparent;\n  font: inherit;\n  color: inherit;\n}`)
+
   writeFileSync(
     join(outDir, 'src', `${name}.tsx`),
-    `import { useState } from 'react';\nimport type { ${name}Props } from './types.js';\nimport styles from './${name}.module.css';\n\nexport function ${name}({ initialData = {}, onAction, onClose }: ${name}Props) {\n  const [data, setData] = useState<Record<string, string>>(initialData);\n\n  const handleChange = (key: string, value: string) => {\n    setData((prev) => ({ ...prev, [key]: value }));\n  };\n\n  return (\n    <div className={styles.root} style={{ width: ${model.width}, height: ${model.height}, background: '${model.tree.background ?? '#fff'}' }}>\n${body}\n    </div>\n  );\n}\n\nexport default ${name};\n`,
+    `import { useState } from 'react';
+import type { ${name}Props } from './types.js';
+import styles from './${name}.module.css';
+
+/**
+ * 由设计稿 ${model.nodeId} 生成的**几何骨架**（扁平绝对定位，坐标已归零）。
+ * 注意：这是"设计准确"的起点，不是最终实现 —— 请按 CODEGEN_PROMPT.md
+ * 把实例占位换成项目既有组件、把绝对定位收敛成 flex、并做截图回归。
+ */
+export function ${name}({ initialData = {}, onAction, onClose }: ${name}Props) {
+  const [data, setData] = useState<Record<string, string>>(initialData);
+  void setData; void onClose;
+
+  return (
+    <div className={styles.root} style={{ width: ${model.width}, height: ${model.height} }}>
+${jsx.join('\n')}
+    </div>
+  );
+}
+
+export default ${name};
+`,
     'utf8',
   )
 
-  // ── module.css ──
-  const borderColor =
-    Object.values(model.tokens.colors).find((c) => /204|cc|d/.test(c.toLowerCase().replace('#', ''))) ?? '#ccc'
-  writeFileSync(
-    join(outDir, 'src', `${name}.module.css`),
-    `.root {\n  position: relative;\n  overflow: hidden;\n  font-family: 'Noto Sans SC', 'Noto Sans CJK SC', system-ui, sans-serif;\n}\n.text {\n  position: absolute;\n  white-space: pre-wrap;\n  line-height: 1.4;\n}\n.input {\n  position: absolute;\n  box-sizing: border-box;\n  border: 1px solid ${borderColor};\n  background: #fff;\n  padding: 8px 12px;\n  font-size: 16px;\n}\n.button {\n  position: absolute;\n  box-sizing: border-box;\n  border: 1px solid ${borderColor};\n  background: #fff;\n  cursor: pointer;\n  font-size: 16px;\n  display: flex;\n  align-items: center;\n  justify-content: center;\n}\n.close {\n  position: absolute;\n  background: transparent;\n  border: none;\n  cursor: pointer;\n  font-size: 18px;\n  line-height: 1;\n}\n.frame {\n  position: absolute;\n  box-sizing: border-box;\n}\n`,
-    'utf8',
-  )
-
-  // ── index.ts ──
+  writeFileSync(join(outDir, 'src', `${name}.module.css`), `${cssRules.join('\n\n')}\n`, 'utf8')
   writeFileSync(
     join(outDir, 'src', 'index.ts'),
     `export { ${name} } from './${name}.js';\nexport type { ${name}Props } from './types.js';\n`,
     'utf8',
   )
-
-  // ── design-spec.json ──
   writeFileSync(join(outDir, 'design-spec.json'), JSON.stringify(model, null, 2), 'utf8')
 
   // ── CODEGEN_PROMPT.md ──
   const round = Math.max(1, opts.round ?? 1)
-  const promptParts = [
-    `# Codegen Prompt（需求 → 最终代码）· 第 ${round} 轮`,
-    '',
-    `设计稿已提取为 \`design-spec.json\`（令牌/树/文本），骨架见 \`src/${name}.tsx\`。`,
-    '',
-    '请按以下要求把骨架补全为高质量实现：',
-    '',
-    '## 需求',
-    opts.requirements,
-    '',
-    '## 项目约定',
-    opts.conventions,
-    '',
-  ]
+  const P: string[] = []
+  P.push(`# Codegen Prompt（需求 → 最终代码）· 第 ${round} 轮`, '')
+  P.push(`设计稿已提取为 \`design-spec.json\`（含逐节点规格表），几何骨架见 \`src/${name}.tsx\`。`)
+  if (opts.staticPagePath) {
+    P.push('', `**视觉基准**：\`${opts.staticPagePath}\`（由设计数据逐节点生成的 1:1 静态还原页）。`)
+    P.push('实现完成后必须把"组件渲染截图"与这张基准页并排对照；对不上就改，不要以"看起来差不多"收尾。')
+  }
+  P.push('', '## 需求', opts.requirements)
+  P.push('', '## 项目约定', opts.conventions)
   if (opts.auditMd) {
-    promptParts.push(
-      '## 设计审计核对清单（实现前逐项勾选，歧义项不要猜）',
-      '',
-      '```markdown',
-      opts.auditMd.trim(),
-      '```',
-      '',
-    )
+    P.push('', '## 设计审计核对清单（逐项勾选；"真歧义"才需要问人，"数据缺失"按兜底规则做）', '', '```markdown', opts.auditMd.trim(), '```', '')
   }
-  if (round > 1 && opts.roundFeedback) {
-    promptParts.push(
-      `## 第 ${round} 轮反馈（上一轮差异/评审）`,
-      '',
-      opts.roundFeedback,
-      '',
-    )
+  P.push('', '## 逐节点规格表（id | name | type | x | y | w | h | 背景 | 描边(四边) | 圆角 | 字体 | 文案 | layout）', '', '```', specTable(model, 500), '```', '')
+  if (instanceTodo.length) {
+    P.push('', '## 需要你用项目组件替换的实例占位（设计数据里没有实例内部结构）', '', ...instanceTodo.slice(0, 120))
   }
-  promptParts.push(
-    `## 必做`,
-    `1. 依据需求把控件标签映射成语义字段（如“房号”→ roomNumber），重写 \`types.ts\` 的 Props；`,
-    `2. 补全交互：受控表单、校验、按钮动作、关闭（Esc/遮罩）、可访问性；`,
-    `3. 保持 \`tokens.ts\` 的设计值，不改样式数字；边框虚线用设计稿的 \`dashPattern\`；`,
-    `4. 复用项目已有的 Button/Input/Modal 原子组件（若有）；没有则保持零外部依赖；`,
-    `5. 输出：\`src/${name}.tsx\`、\`src/types.ts\`、\`src/use${name}.ts\`（逻辑 hooks）、必要测试；`,
-    `6. 代码简洁、可扩展、类型安全，不引入第三方运行时依赖。`,
+  P.push(
     '',
-    '## 运行时行为：先查项目既有实现，再写代码（不要自己发明）',
+    '## 必做',
+    '1. **先看基准页**：`index.html`/`SPEC.md` 是视觉与规格基准，逐条对齐；',
+    '2. **占位换组件**：把 `data-design-name` 标记的占位换成项目既有组件（Input/Select/DatePicker/Button…），',
+    '   不要自己重画控件；设计给的尺寸/逐角圆角/文案要保留；',
+    '3. **绝对定位收敛成布局**：把"并列/堆叠"关系改成项目约定的 flex 布局（规格表里的 layout 列就是 auto-layout 依据），',
+    '   只在确实需要的地方保留绝对定位；',
+    '4. **色值走主题令牌**：`tokens.ts` 里是设计稿 literal 值，落项目时映射到项目主题变量；',
+    '   映射不上的列出来找设计确认（不要静默换成别的颜色）；',
+    '5. **逐边描边/逐角圆角**：`border-width` 分边写（如"只有左边框"），拼接控件组用相邻重叠 1px 共用一条边；',
+    '6. 交互：受控表单、校验、按钮动作、关闭（Esc/遮罩）、可访问性；输出 `src/${name}.tsx`、`src/types.ts`、逻辑 hooks、必要测试；',
+    '7. 类型安全、不引入第三方运行时依赖。',
     '',
-    '在目标仓库内 grep 以下关键词，找到对应组件后读源码照抄既有模式：',
-    '',
-    '```bash',
-    '# 固定/吸底相关',
-    'grep -rn "position: fixed" src --include="*.less" --include="*.css"',
-    'grep -rn "position: sticky" src --include="*.less" --include="*.css"',
-    'grep -rn "bottom: 0" src --include="*.less" --include="*.css"',
-    '',
-    '# 现有 footer/操作栏实现',
-    'grep -rn "footer-wrap\\|profile-footer-wrap\\|ant-row-flex-end" src --include="*.tsx" --include="*.less"',
-    '',
-    '# 侧边栏展开/收起',
-    'grep -rn "collapsed\\|is-collapse\\|menu-collapsed\\|side.*bar" src --include="*.tsx" --include="*.less" | head -50',
-    '',
-    '# 布局宽度',
-    'grep -rn "220px\\|width: 220" src --include="*.less"',
-    '```',
-    '',
-    '例如：若项目已有底部操作栏约定（如 \`profile-footer-wrap\`：position: fixed; width: 100%; left: 0; bottom: 0; z-index: 20），',
-    '就照抄该模式（靠侧边栏遮挡自适应展开/收起），不要自己写死 left:220px。',
-    '',
-    '## 验证闭环',
-    '1. 本地 WS 解码 JSON → 审计清单逐项勾选；',
-    '2. 有歧义节点（fill visible=false / strokeWeight>0 但无 strokePaints）标记“待人工确认”，不要猜；',
-    '3. 视觉参照：REST 可用时用 figma_read_node 渲染 PNG；429 时用 figma_read_node_ws 截浏览器视口对照；',
-    '4. 全部 checklist 勾选 + 截图对照无差异后才算完成。',
-    '',
-    '## 沉淀可复用事实',
-    '把查到的既有模式（如“本应用底部操作栏统一用 profile-footer-wrap：fixed + width 100% + left 0”）记入 Noema，',
-    '下次同类页面直接复用，不再重新踩坑。',
+    '## 验证闭环（不做完不算完成）',
+    '1. 按审计清单逐项勾选，**每项写清"在哪个文件哪一行实现的"**；',
+    '2. 组件渲染截图 ↔ 基准页截图并排对照，差异逐条列出并修掉；',
+    '3. 逐边描边、逐角圆角、控件高度这几类**必须用实测数值核对**（computed style），不要靠肉眼；',
+    '4. 把查到的项目既有模式（如"底部操作栏统一用 xxx"）沉淀成可复用事实。',
   )
-  writeFileSync(join(outDir, 'CODEGEN_PROMPT.md'), promptParts.join('\n'), 'utf8')
+  writeFileSync(join(outDir, 'CODEGEN_PROMPT.md'), P.join('\n'), 'utf8')
 
-  // ── README.md ──
   writeFileSync(
     join(outDir, 'README.md'),
     `# ${name}
 
-由 dsh-design-to-code 从 Figma 节点 \`${model.nodeId}\` 生成（零 REST API）。
+由 dsh-design-to-code 从设计稿节点 \`${model.nodeId}\` 生成（零 REST API）。
 
-- 设计令牌：\`src/tokens.ts\`
-- 组件骨架：\`src/${name}.tsx\`
-- 契约：\`src/types.ts\`
+- 视觉基准：\`SPEC.md\`（规格 + 映射表）与静态还原页（由 \`figma_render_static\` 产出，路径见 CODEGEN_PROMPT.md）
+- 设计令牌：\`src/tokens.ts\`（设计 literal 值，落项目要映射主题令牌）
+- 几何骨架：\`src/${name}.tsx\` + \`src/${name}.module.css\`
 - 补全指引：\`CODEGEN_PROMPT.md\`
-
-## 运行
-\`\`\`bash
-npm i && npm run dev   # 按项目约定调整
-\`\`\`
 `,
     'utf8',
   )
@@ -286,4 +277,8 @@ npm i && npm run dev   # 按项目约定调整
     join(outDir, 'CODEGEN_PROMPT.md'),
     join(outDir, 'README.md'),
   ]
+}
+
+export function summarizeAudit(a: AuditResult): string {
+  return `节点 ${a.nodeCount}（实例 ${a.instanceCount}）· 核对项 ${a.checklist.length} · 真歧义 ${a.ambiguous.length} · 数据缺失 ${a.missing.length}`
 }

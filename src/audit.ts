@@ -1,42 +1,17 @@
 /**
- * 设计审计（Design Audit）：全量遍历目标节点，逐节点输出完整视觉属性，
- * 并自动生成「实现前核对清单」（checklist）。
+ * 设计审计（Design Audit）：把 DesignModel 变成一份**可核对的实现清单**。
  *
- * 记忆 mem_88d6b6f0（ARS 教训）：
- * - 不要只读“看着像容器”的节点，要全量遍历（背景/边框常藏在子容器）；
- * - Kiwi 用 guid(sessionID:localID)，fills 字段是 fillPaints；
- * - 虚线边框在 dashPattern（如 [4]），不是 strokeDashes；
- * - fill visible=false 或 strokeWeight>0 但 strokePaints 为空 → 标记“待人工确认”，不要猜。
+ * 与上一版的区别（都是实测教训）：
+ * - 不再用 `strokeWeight > 0 && strokePaints 为空` 判"隐藏边框"：Kiwi 里 strokeWeight 是
+ *   带默认值的标量（实测 364 个节点 281 个 =1，真有描边的只有 22 个），该判据会对
+ *   259 个"本来就没描边"的节点误报，最终把清单变成噪音、让会话 LLM 直接忽略整份清单。
+ * - 描边按**逐边**读（borderStrokeWeightsIndependent + border*Weight），
+ *   圆角按**逐角**读（rectangleCornerRadiiIndependent + rectangle*CornerRadius）。
+ * - checklist 按类型分组并去重（同一套"背景 #fff / 描边 1px #dee0ec"只出现一次）。
+ * - 把"**数据缺失**（实例内部数据 ws.json 里没有，必须用项目组件重建）"与
+ *   "**真歧义**（设计本身没画清，需要问设计）"分开：前者给兜底规则，不写"不要猜"。
  */
-
-type Any = Record<string, any>
-
-export interface AuditEntry {
-  guid: string
-  name: string
-  type: string
-  x: number
-  y: number
-  w: number
-  h: number
-  fillPaints: Array<{ visible: boolean; rgba: string; type: string }>
-  strokePaints: Array<{ visible: boolean; rgba: string; type: string }>
-  strokeWeight: number | null
-  strokeAlign: string | null
-  dashPattern: number[]
-  padding: { top: number | null; right: number | null; bottom: number | null; left: number | null }
-  text: {
-    characters: string
-    fontSize: number | null
-    fontWeight: string | null
-    lineHeight: number | null
-    letterSpacing: number | null
-    color: string | null
-    alignHorizontal: string | null
-  } | null
-  effects: Array<{ type: string; visible: boolean; css: string }>
-  ambiguous: string[]
-}
+import type { DesignModel, DesignNode, DesignSpecRow } from './design.js'
 
 export interface AuditResult {
   fileKey: string
@@ -44,181 +19,172 @@ export interface AuditResult {
   componentName: string
   width: number
   height: number
-  entries: AuditEntry[]
+  nodeCount: number
+  instanceCount: number
   checklist: string[]
-  ambiguousCount: number
+  /** 真歧义：设计本身没说清，需要问设计（数量应为个位数） */
+  ambiguous: string[]
+  /** 数据缺失：解码数据里就没有，按兜底规则处理（不是"歧义"） */
+  missing: string[]
+  rows: DesignSpecRow[]
 }
 
-function rgba(p: Any | undefined): string {
-  if (!p || p.type !== 'SOLID' || !p.color) return ''
-  const c = p.color
-  const a = p.opacity ?? c.a ?? 1
-  return `rgba(${Math.round((c.r ?? 0) * 255)},${Math.round((c.g ?? 0) * 255)},${Math.round((c.b ?? 0) * 255)},${a})`
-}
-
-function paints(list: Any[] | undefined, key: 'fillPaints' | 'strokePaints') {
-  return (list ?? []).map((p) => ({
-    visible: p.visible !== false,
-    rgba: rgba(p),
-    type: p.type ?? '',
-  }))
-}
-
-function effectsCss(e: Any): string {
-  if (e.type === 'DROP_SHADOW' || e.type === 'INNER_SHADOW') {
-    const c = e.color ?? {}
-    const a = e.opacity ?? c.a ?? 1
-    return `inset=${e.type === 'INNER_SHADOW'} ${e.offset?.x ?? 0}px ${e.offset?.y ?? 0}px ${e.radius ?? 0}px ${e.spread ?? 0}px rgba(${Math.round((c.r ?? 0) * 255)},${Math.round((c.g ?? 0) * 255)},${Math.round((c.b ?? 0) * 255)},${a})`
+function flat(model: DesignModel): DesignNode[] {
+  const out: DesignNode[] = []
+  const walk = (n: DesignNode): void => {
+    if (n.raw.visible === false) return
+    out.push(n)
+    for (const c of n.children) walk(c)
   }
-  if (e.type === 'LAYER_BLUR') return `blur(${e.radius ?? 0}px)`
-  return JSON.stringify(e)
+  walk(model.tree)
+  return out
 }
 
-export function auditNode(nodeJson: Any): AuditResult {
-  const node = nodeJson.node as Any
-  const descendants = (nodeJson.descendants ?? []) as Any[]
-
-  const byId = new Map<string, Any>()
-  for (const n of [node, ...descendants]) {
-    if (n?.guid) byId.set(`${Number(n.guid.sessionID)}:${Number(n.guid.localID)}`, n)
-  }
-  const childrenMap = new Map<string, Any[]>()
-  for (const n of descendants) {
-    const p = n?.parentIndex?.guid
-    if (!p) continue
-    const pk = `${Number(p.sessionID)}:${Number(p.localID)}`
-    if (!childrenMap.has(pk)) childrenMap.set(pk, [])
-    childrenMap.get(pk)!.push(n)
-  }
-
-  const entries: AuditEntry[] = []
+export function auditModel(model: DesignModel): AuditResult {
+  const nodes = flat(model)
   const checklist = new Set<string>()
   const ambiguous: string[] = []
+  const missing = new Set<string>()
 
-  const walk = (n: Any, absX = 0, absY = 0, depth = 0): void => {
-    const t = n.transform ?? {}
-    const s = n.size ?? {}
-    const x = absX + Number(t.m02 ?? 0)
-    const y = absY + Number(t.m12 ?? 0)
-    const guid = `${Number(n.guid?.sessionID ?? 0)}:${Number(n.guid?.localID ?? 0)}`
-    const name = String(n.name ?? '')
-    const type = String(n.type ?? '')
-
-    const fill = paints(n.fillPaints, 'fillPaints')
-    const stroke = paints(n.strokePaints, 'strokePaints')
-    const strokeWeight = typeof n.strokeWeight === 'number' ? n.strokeWeight : null
-    const dashPattern = Array.isArray(n.dashPattern) ? n.dashPattern.map(Number) : []
-    const padding = {
-      top: typeof n.paddingTop === 'number' ? n.paddingTop : null,
-      right: typeof n.paddingRight === 'number' ? n.paddingRight : null,
-      bottom: typeof n.paddingBottom === 'number' ? n.paddingBottom : null,
-      left: typeof n.paddingLeft === 'number' ? n.paddingLeft : null,
+  // ── 骨架 ──
+  checklist.add(`【骨架】画布 ${model.width}×${model.height}（节点 ${nodes.length}）`)
+  for (const n of nodes) {
+    if (n.kind === 'frame' || n.kind === 'root') {
+      if (n.w && n.h) checklist.add(`【骨架】容器 "${n.name}" ${n.w}×${n.h} @(${n.x},${n.y})`)
     }
-    const effects = (n.effects ?? [])
-      .filter((e: Any) => e && e.visible !== false)
-      .map((e: Any) => ({ type: e.type ?? '', visible: e.visible !== false, css: effectsCss(e) }))
-
-    const textNode = type === 'TEXT'
-    const text = textNode
-      ? {
-          characters: String(n.textData?.characters ?? ''),
-          fontSize: typeof n.fontSize === 'number' ? n.fontSize : null,
-          fontWeight: n.fontName?.style ? String(n.fontName.style) : null,
-          lineHeight: typeof n.lineHeight?.value === 'number' ? n.lineHeight.value : null,
-          letterSpacing: typeof n.letterSpacing?.value === 'number' ? n.letterSpacing.value : null,
-          color: rgba((n.fillPaints ?? []).find((p: Any) => p.type === 'SOLID')),
-          alignHorizontal: n.textAlignHorizontal ? String(n.textAlignHorizontal) : null,
-        }
-      : null
-
-    const entry: AuditEntry = {
-      guid, name, type,
-      x: Math.round(x), y: Math.round(y), w: Math.round(Number(s.x ?? 0)), h: Math.round(Number(s.y ?? 0)),
-      fillPaints: fill, strokePaints: stroke, strokeWeight, strokeAlign: n.strokeAlign ? String(n.strokeAlign) : null,
-      dashPattern, padding, text, effects, ambiguous: [],
-    }
-
-    // ── 歧义标记（不猜） ──
-    const hiddenFills = fill.filter((p) => !p.visible)
-    if (hiddenFills.length) entry.ambiguous.push(`fill visible=false: ${hiddenFills.map((p) => p.rgba || p.type).join(', ')}`)
-    if (strokeWeight && strokeWeight > 0 && stroke.length === 0) {
-      entry.ambiguous.push(`strokeWeight=${strokeWeight} 但 strokePaints 为空（可能隐藏边框，需人工确认）`)
-    }
-    if (dashPattern.length && stroke.length === 0) {
-      entry.ambiguous.push(`dashPattern=${JSON.stringify(dashPattern)} 但无 strokePaints（虚线需要人工确认颜色）`)
-    }
-
-    // ── checklist 归纳 ──
-    if (fill.some((p) => p.visible && p.rgba)) {
-      checklist.add(`${type} "${name}" 背景 ${fill.find((p) => p.visible)?.rgba}`)
-    }
-    if (stroke.some((p) => p.visible)) {
-      const sc = stroke.find((p) => p.visible)?.rgba
-      const dash = dashPattern.length ? ` dashed ${JSON.stringify(dashPattern)}` : ''
-      checklist.add(`${type} "${name}" 边框 ${sc}${strokeWeight ? ` ${strokeWeight}px` : ''}${dash}`)
-    }
-    if (textNode && text?.characters) {
-      checklist.add(`文本 "${text.characters}" ${text.fontSize}px/${text.fontWeight} ${text.color}`)
-    }
-    if (padding.top != null || padding.left != null) {
-      checklist.add(`${type} "${name}" padding ${padding.top}/${padding.right}/${padding.bottom}/${padding.left}`)
-    }
-    if (effects.length) {
-      for (const e of effects) checklist.add(`${type} "${name}" effect ${e.type} ${e.css}`)
-    }
-    for (const a of entry.ambiguous) ambiguous.push(`[${guid}] ${name}: ${a}`)
-
-    entries.push(entry)
-
-    const kids = childrenMap.get(guid) ?? []
-    for (const k of kids) walk(k, x, y, depth + 1)
   }
 
-  walk(node)
+  // ── 逐边描边：按 (颜色, 四边, 圆角) 去重 ──
+  const borderSet = new Map<string, string[]>()
+  for (const n of nodes) {
+    if (!n.border) continue
+    const b = n.border
+    const edges = `${b.top}/${b.right}/${b.bottom}/${b.left}`
+    const key = `${b.color} ${edges} r=${n.radius ?? '0'}`
+    if (!borderSet.has(key)) borderSet.set(key, [])
+    const list = borderSet.get(key)!
+    if (list.length < 4) list.push(`${n.id} "${n.name}"`)
+  }
+  for (const [key, who] of borderSet) {
+    const only = key.split(' ')[1]
+    const note = only === '0/0/0/1' || only === '0/0/0/2'
+      ? ' ← 只有左边框'
+      : only.startsWith('0/0/1') ? ' ← 只有下边框' : ''
+    checklist.add(`【描边】${key}${note} · 例：${who.join('、')}`)
+  }
 
-  const size = node.size ?? {}
+  // ── 逐角圆角 ──
+  const radiusSet = new Map<string, number>()
+  for (const n of nodes) {
+    if (!n.radius) continue
+    radiusSet.set(n.radius, (radiusSet.get(n.radius) ?? 0) + 1)
+  }
+  for (const [r, c] of [...radiusSet.entries()].sort((a, b) => b[1] - a[1])) {
+    const perCorner = r.includes(' ')
+    checklist.add(`【圆角】${r}${perCorner ? '（逐角不同：拼接控件组两端圆角/中间直角）' : ''} × ${c} 处`)
+  }
+
+  // ── 字体 ──
+  const fontSet = new Map<string, number>()
+  for (const n of nodes) {
+    if (!n.text) continue
+    const key = `${n.text.family} ${n.text.weight} ${n.text.size}px${n.text.lineHeight ? `/${n.text.lineHeight}` : ''} ${n.text.color ?? ''}`
+    fontSet.set(key, (fontSet.get(key) ?? 0) + 1)
+  }
+  for (const [f, c] of [...fontSet.entries()].sort((a, b) => b[1] - a[1])) {
+    checklist.add(`【字体】${f} × ${c} 处`)
+  }
+
+  // ── auto-layout（落组件时要变成 flex，别绝对定位） ──
+  for (const n of nodes) {
+    if (!n.layout?.mode) continue
+    checklist.add(
+      `【布局】"${n.name}" ${n.layout.mode} spacing=${n.layout.spacing ?? '-'} padding=${n.layout.paddingTop ?? '-'}/${n.layout.paddingRight ?? '-'}/${n.layout.paddingBottom ?? '-'}/${n.layout.paddingLeft ?? '-'}${n.layout.counterAlign ? ` align=${n.layout.counterAlign}` : ''}`,
+    )
+  }
+
+  // ── 阴影 ──
+  for (const s of model.tokens.shadows) checklist.add(`【阴影】${s}`)
+
+  // ── 真歧义（设计没说清） ──
+  for (const n of nodes) {
+    const raw = n.raw
+    const hiddenFills = (raw.fillPaints ?? []).filter((p: any) => p && p.visible === false)
+    if (hiddenFills.length) ambiguous.push(`[${n.id}] ${n.name}：有 fill 但 visible=false（到底要不要底色？）`)
+    const hasStrokeGeometry = Array.isArray(raw.strokeGeometry) && raw.strokeGeometry.length > 0
+    if (hasStrokeGeometry && !n.border) {
+      ambiguous.push(`[${n.id}] ${n.name}：有描边几何但读不到 strokePaints/描边权重（颜色待确认）`)
+    }
+    if (Array.isArray(raw.dashPattern) && raw.dashPattern.length && !n.border) {
+      ambiguous.push(`[${n.id}] ${n.name}：dashPattern=${JSON.stringify(raw.dashPattern)} 但无描边信息（虚线颜色待确认）`)
+    }
+  }
+
+  // ── 数据缺失（有兜底规则，不是"不要猜"） ──
+  const opaqueInstances = nodes.filter((n) => n.instanceInternalMissing)
+  if (opaqueInstances.length) {
+    const byName = new Map<string, number>()
+    for (const n of opaqueInstances) byName.set(n.name, (byName.get(n.name) ?? 0) + 1)
+    missing.add(
+      `【实例内部数据缺失】${opaqueInstances.length} 个实例（${[...byName.entries()].map(([k, v]) => `${k}×${v}`).join('、')}）：`
+      + 'ws.json 里实例无 children / 无 fillPaints / 无 strokePaints，内部结构拿不到。'
+      + '兜底规则：用**项目既有组件**重建（尺寸/逐角圆角/覆写文案已给出），不要自己画一套控件。',
+    )
+    const withText = opaqueInstances.filter((n) => n.value)
+    if (withText.length) {
+      missing.add(
+        `【实例文案已从覆写链取到】${withText.length} 处，例：${withText.slice(0, 8).map((n) => `${n.name}="${n.value}"`).join('、')}`,
+      )
+    }
+  }
+
   return {
-    fileKey: String(nodeJson.fileKey ?? ''),
-    nodeId: String(nodeJson.nodeId ?? ''),
-    componentName: String(node.name ?? '设计组件'),
-    width: Math.round(Number(size.x ?? 0)),
-    height: Math.round(Number(size.y ?? 0)),
-    entries,
+    fileKey: model.fileKey,
+    nodeId: model.nodeId,
+    componentName: model.componentName,
+    width: model.width,
+    height: model.height,
+    nodeCount: nodes.length,
+    instanceCount: nodes.filter((n) => n.type === 'INSTANCE').length,
     checklist: [...checklist],
-    ambiguousCount: ambiguous.length,
+    ambiguous,
+    missing: [...missing],
+    rows: model.spec,
   }
 }
 
-/** 生成「实现前核对清单」markdown。 */
 export function auditToMarkdown(a: AuditResult): string {
-  const lines: string[] = []
-  lines.push(`# 设计审计：${a.componentName}（${a.fileKey} · ${a.nodeId}）`)
-  lines.push('')
-  lines.push(`- 画布：${a.width}×${a.height} · 节点数：${a.entries.length} · 歧义数：${a.ambiguousCount}`)
-  lines.push('')
-  lines.push('## 实现前核对清单')
-  lines.push('')
-  for (const c of a.checklist) lines.push(`- [ ] ${c}`)
-  const ambiguousLines = a.entries.flatMap((e) => e.ambiguous.map((x) => `[${e.guid}] ${e.name}: ${x}`))
-  if (ambiguousLines.length) {
-    lines.push('')
-    lines.push('## ⚠️ 待人工确认（不要猜）')
-    lines.push('')
-    for (const am of ambiguousLines) lines.push(`- [ ] ${am}`)
+  const L: string[] = []
+  L.push(`# 设计审计：${a.componentName}（${a.fileKey} · ${a.nodeId}）`)
+  L.push('')
+  L.push(`- 画布：${a.width}×${a.height} · 节点 ${a.nodeCount}（实例 ${a.instanceCount}）`)
+  L.push(`- 核对项 ${a.checklist.length} · 真歧义 ${a.ambiguous.length} · 数据缺失 ${a.missing.length}`)
+  L.push('')
+  L.push('## 实现前核对清单')
+  L.push('')
+  for (const c of a.checklist) L.push(`- [ ] ${c}`)
+  if (a.missing.length) {
+    L.push('')
+    L.push('## 数据缺失（按兜底规则做，不必问设计）')
+    L.push('')
+    for (const m of a.missing) L.push(`- ${m}`)
   }
-  lines.push('')
-  lines.push('## 全量节点清单')
-  lines.push('')
-  lines.push('| guid | name | type | x | y | w | h | 背景 | 边框 | strokeWeight | dashPattern | padding | 文本 | 阴影 |')
-  lines.push('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
-  for (const e of a.entries) {
-    const bg = e.fillPaints.find((p) => p.visible && p.rgba)?.rgba ?? ''
-    const sc = e.strokePaints.find((p) => p.visible)?.rgba ?? ''
-    const txt = e.text ? `${e.text.characters.replace(/\|/g, '\\|')} ${e.text.fontSize ?? ''}px/${e.text.fontWeight ?? ''}` : ''
-    lines.push(
-      `| ${e.guid} | ${e.name.replace(/\|/g, '\\|')} | ${e.type} | ${e.x} | ${e.y} | ${e.w} | ${e.h} | ${bg} | ${sc} | ${e.strokeWeight ?? ''} | ${e.dashPattern.length ? JSON.stringify(e.dashPattern) : ''} | ${e.padding.top ?? ''}/${e.padding.right ?? ''}/${e.padding.bottom ?? ''}/${e.padding.left ?? ''} | ${txt} | ${e.effects.map((f) => f.type).join(', ')} |`,
+  if (a.ambiguous.length) {
+    L.push('')
+    L.push('## ⚠️ 真歧义（需要问设计，不要猜）')
+    L.push('')
+    for (const m of a.ambiguous) L.push(`- [ ] ${m}`)
+  }
+  L.push('')
+  L.push('## 全量节点清单')
+  L.push('')
+  L.push('| guid | name | type | x | y | w | h | 背景 | 边框四边 T/R/B/L | 圆角 | 字体 | 文案 | layout |')
+  L.push('|---|---|---|---|---|---|---|---|---|---|---|---|---|')
+  for (const e of a.rows) {
+    L.push(
+      `| ${e.id} | ${String(e.name).replace(/\|/g, '\\|')} | ${e.type} | ${e.x} | ${e.y} | ${e.w} | ${e.h} | ${e.background ?? ''} | ${e.borderEdges ? `${e.border}(${e.borderEdges})` : ''} | ${e.radius ?? ''} | ${e.font ?? ''} | ${String(e.text ?? '').replace(/\|/g, '\\|')} | ${e.layout ?? ''} |`,
     )
   }
-  lines.push('')
-  return lines.join('\n')
+  L.push('')
+  return L.join('\n')
 }
