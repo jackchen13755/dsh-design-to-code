@@ -37,3 +37,25 @@ export declare function pngSummary(results: PngExportResult[]): string;
 /** 供 UI 专家子 agent 用的读图清单（主 agent 转交时必须抄） */
 export declare function expertImageBrief(paths: string[], staticPath: string, specPath?: string): string;
 export declare function defaultPngDir(htmlPath: string): string;
+export interface DumpDomOptions {
+    htmlPath: string;
+    width: number;
+    height: number;
+    chromeBin?: string;
+    /** 等待脚本跑完的虚拟时间（毫秒） */
+    settleMs?: number;
+    /** 允许 file:// 页面互访（探针 iframe 读实现页的 computed style 必需） */
+    allowFileAccess?: boolean;
+}
+export interface DumpDomResult {
+    ok: boolean;
+    html?: string;
+    bin?: string;
+    error?: string;
+}
+/**
+ * HTML → 序列化后的 DOM（`--dump-dom`）。
+ * 用途：在页面里跑一段脚本、把结果写进 `<pre>`，再把 DOM 取回来 ——
+ * 这是零依赖拿到 "实现页的真实 computed style" 的办法。
+ */
+export declare function dumpDom(opts: DumpDomOptions): Promise<DumpDomResult>;

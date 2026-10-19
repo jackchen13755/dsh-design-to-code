@@ -1,3 +1,14 @@
+## v0.2.0（多轮评审根因修复）
+
+这一版不是加功能，是修"为什么必须多轮评审"：
+
+- **门禁**：`confirmed` 只在「基准审计 scope=baseline 且 verdict=pass 且有效条目>0」时置真；评审表格按表头取级别列（旧实现丢列 → blocker 掉成 info → verdict=pass）；baseline/implementation 分区统计；known-diffs 只压 minor/info、blocker 永不抑制；旧 flow.json 缺 `gateVersion` 一律视为未确认。
+- **布局**：auto-layout 六字段（主轴对齐/双轴 sizing/grow/align-self/wrap/ABSOLUTE）进模型；静态基准页与代码骨架**共用 `layout.ts` 同一套规则**直接出 flex；另出 `abs.html` 全绝对定位对照页 + `abs-vs-flex.json` 推演断言。描边改用 inset box-shadow / outline（**不占布局**，否则每个带边框的容器里子项会整体偏 1–2px）。
+- **绘制**：逐边全 0 不再回落 `strokeWeight`（幽灵边框）、逐角显式 0 不再回落 `cornerRadius`；`dashPattern` 进模型；`textAlignVertical` / `lineHeight=0` / 字重与斜体；TEXT 的 fill 归到字色（不再当背景）；实例自身真实绘制值优先，缺失才用设计系统常量并打 `data-guessed`。
+- **台账与回归**：`coverage.json`（design/inferred/placeholder 逐属性来源）；`figma_visual_diff` 用无头 Chrome 探针逐节点取 computed style，产出 expected/actual/Δ（可直接喂 `figma_review_to_round` 的 `items`）。
+
+自测：`npm run selftest`（真实解码数据 132:8008，57 项断言；含"基准页对自身 0 条视觉差异"与收尾门禁端到端用例）。
+
 # dsh-design-to-code
 
 DSH 工具：**设计稿 → 可核对的视觉基准 / 审计清单 / 代码骨架 / 变更简报**。

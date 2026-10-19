@@ -12,8 +12,9 @@
  * 图上那部分是**按设计系统重建的占位** —— 需要"真实观感"时仍应另配 Figma 画布截图。
  */
 import { execFile } from 'node:child_process'
-import { existsSync, statSync } from 'node:fs'
+import { existsSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 
 export interface PngExportOptions {
   htmlPath: string
@@ -153,4 +154,65 @@ export function expertImageBrief(paths: string[], staticPath: string, specPath?:
 
 export function defaultPngDir(htmlPath: string): string {
   return join(htmlPath, '..')
+}
+
+export interface DumpDomOptions {
+  htmlPath: string
+  width: number
+  height: number
+  chromeBin?: string
+  /** 等待脚本跑完的虚拟时间（毫秒） */
+  settleMs?: number
+  /** 允许 file:// 页面互访（探针 iframe 读实现页的 computed style 必需） */
+  allowFileAccess?: boolean
+}
+
+export interface DumpDomResult {
+  ok: boolean
+  html?: string
+  bin?: string
+  error?: string
+}
+
+/**
+ * HTML → 序列化后的 DOM（`--dump-dom`）。
+ * 用途：在页面里跑一段脚本、把结果写进 `<pre>`，再把 DOM 取回来 ——
+ * 这是零依赖拿到 "实现页的真实 computed style" 的办法。
+ */
+export function dumpDom(opts: DumpDomOptions): Promise<DumpDomResult> {
+  const bin = findChromeBin(opts.chromeBin)
+  if (!bin) {
+    return Promise.resolve({ ok: false, error: '找不到可用的无头浏览器（Chrome/Chromium/Edge/Brave）。可用 DSH_CHROME_BIN 指定路径。' })
+  }
+  // 显式 user-data-dir：并发的 headless 实例抢默认 profile 时会直接失败
+  //（"Failed to create a unique user data directory for headless"）
+  const profileDir = join(tmpdir(), `dsh-design-to-code-${process.pid}-${Date.now()}`)
+  const args = [
+    '--headless=new',
+    '--disable-gpu',
+    '--hide-scrollbars',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-extensions',
+    // 同上：headless 在受限环境下必须先关掉自己的 sandbox
+    '--no-sandbox',
+    `--user-data-dir=${profileDir}`,
+    `--window-size=${opts.width},${opts.height}`,
+    `--virtual-time-budget=${opts.settleMs ?? 4000}`,
+    '--dump-dom',
+  ]
+  if (opts.allowFileAccess !== false) args.push('--allow-file-access-from-files')
+  args.push(`file://${opts.htmlPath}`)
+  return new Promise((resolve) => {
+    execFile(bin, args, { timeout: 60_000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => {
+      // 临时 profile 用完即删（否则反复跑会攒一堆目录）
+      try { rmSync(profileDir, { recursive: true, force: true }) } catch { /* ignore */ }
+      const html = String(stdout ?? '')
+      if (!html) {
+        resolve({ ok: false, bin, error: `没拿到 DOM：${err?.message ?? 'unknown'}\n${String(stderr).slice(0, 400)}` })
+        return
+      }
+      resolve({ ok: true, html, bin })
+    })
+  })
 }

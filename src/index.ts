@@ -5,6 +5,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { buildDesignModel } from './design.js'
 import { generateCode, summarizeAudit } from './codegen.js'
 import { auditModel, auditToMarkdown } from './audit.js'
@@ -16,9 +17,13 @@ import { findCodeHits, keywordsOf, renderChangeMarkdown } from './diff.js'
 import { expertImageBrief, exportStaticPagePng, pngPathsFor, pngSummary, renderHtmlToPng } from './screenshot.js'
 import { buildAnnotatedHtml, legendHeightFor, renderRejectionMarkdown, verdictOf, type AnnotationInput } from './annotate.js'
 import {
-  hasExpertReview, openByeSeverity, openItems, parseReview, renderReviewRound, summarizeRounds,
-  type ReviewItem, type ReviewItemState, type ReviewRoundState,
+  acceptedItems, isSuppressible, matchKnownDiff, hasExpertReview, normalizeBaselineSeverity, openBySeverity, openItems,
+  parseReview, renderReviewRound, summarizeRounds,
+  type KnownDiff, type ReviewItem, type ReviewItemState, type ReviewRoundState,
 } from './review.js'
+import { visualDiff, type SpecRowLite } from './visual-diff.js'
+import { GATE_VERSION, type FlowState } from './flow.js'
+import { evaluateCloseGate } from './gate.js'
 
 export const name = '@deepseek-ai/dsh-tool-design-to-code'
 export const inject = ['tools']
@@ -75,29 +80,6 @@ async function findDataFrame(dir: string): Promise<{ dataPath: string; schemaPat
   )
   stats.sort((a, b) => b.m - a.m)
   return { dataPath: join(dir, stats[0].f), schemaPath: null, manifest: null }
-}
-
-/**
- * 流程状态（flow.json）：把"基准页是否已生成 / 是否已被人工确认"变成**可审计的状态**，
- * 而不是靠提示词自觉。任何 agent（主 agent / 专家 / teammate）都读得到、也绕不过硬门禁。
- */
-interface FlowState {
-  stage: 'static_rendered' | 'skeleton_generated' | 'change_brief_ready'
-  nodeId: string
-  fileKey: string
-  staticPage?: string
-  specPath?: string
-  confirmed: boolean
-  /** 谁确认的基准页：human（人看基准页）| expert_review（UI 专家审计通过，按流程约定可替代人工确认） */
-  confirmedVia?: 'human' | 'expert_review'
-  confirmedBy?: string
-  confirmedAt?: string
-  confirmNote?: string
-  /** 涉及 UI 的交付必须走一轮 UI 专家审计（默认 true；figma_codegen_round 会据此卡收尾） */
-  expertReviewRequired?: boolean
-  /** 专家整改清单的轮次记录（figma_review_to_round 维护） */
-  reviews?: ReviewRoundState[]
-  updatedAt: string
 }
 
 async function readFlow(outDir: string): Promise<FlowState | null> {
@@ -173,16 +155,21 @@ function parseItemsJson(raw?: string): ReviewItem[] | null {
   try {
     const arr = JSON.parse(raw)
     if (!Array.isArray(arr)) return null
-    return arr.map((it: any, i: number) => ({
+    return arr.map((it: any, i: number) => {
+      const sevOk = ['blocker', 'major', 'minor', 'info'].includes(String(it.severity))
+      return {
       id: String(it.id ?? `R${i + 1}`),
-      severity: (['blocker', 'major', 'minor', 'info'].includes(String(it.severity)) ? String(it.severity) : 'info') as ReviewItem['severity'],
+      severity: (sevOk ? String(it.severity) : 'info') as ReviewItem['severity'],
+      // 缺级别必须标 default：baseline 的 fail-closed 提升与 known-diffs 抑制都靠它
+      severitySource: (sevOk ? 'column' : 'default') as ReviewItem['severitySource'],
       text: String(it.text ?? it.issue ?? it.description ?? '').slice(0, 400),
       location: it.location ? String(it.location) : undefined,
       expected: it.expected ? String(it.expected) : undefined,
       actual: it.actual ? String(it.actual) : undefined,
       nodeId: it.node_id ? String(it.node_id) : (it.nodeId ? String(it.nodeId) : undefined),
       box: Array.isArray(it.box) && it.box.length === 4 ? (it.box.map(Number) as [number, number, number, number]) : undefined,
-    })).filter((it) => it.text)
+      } as ReviewItem
+    }).filter((it) => it.text)
   } catch {
     return null
   }
@@ -270,17 +257,38 @@ export function apply(ctx: Context, config: Config): void {
           pngPaths = results.filter((x) => x.ok && x.path).map((x) => x.path!)
           if (pngPaths.length) brief = expertImageBrief(pngPaths, r.htmlPath, r.specPath)
         }
+        const prevFlow = await readFlow(outDir)
         const flow = await writeFlow(outDir, {
           stage: 'static_rendered', nodeId, fileKey,
           staticPage: r.htmlPath, specPath: r.specPath, confirmed: false,
-          confirmedBy: undefined, confirmedAt: undefined, confirmNote: undefined,
+          confirmedBy: undefined, confirmedAt: undefined, confirmNote: undefined, confirmedVia: undefined,
+          baselineRenderer: 2,
+          // 基准页重渲染 = 基准变了：旧评审与旧 known-diffs 一律失效，
+          // 否则"改了稿还沿用旧评审"会直接绕过确认门禁（真实踩过）。
+          reviews: [],
+          knownDiffs: [],
+          baselineVersion: (prevFlow?.baselineVersion ?? 0) + 1,
+          gateVersion: GATE_VERSION,
+          coverage: {
+            nodes: model.coverage.nodes,
+            placeholderRatio: model.coverage.placeholderRatio,
+            counts: model.coverage.counts,
+            summary: model.coverage.summary,
+          },
         })
         void flow
         return [
           `🖼️ 已生成静态还原页（设计 ${fileKey} · 节点 ${nodeId}）`,
           `- 画布 ${model.width}×${model.height} · 渲染节点 ${r.stats.nodes} · 实例重建 ${r.stats.instances} · CSS 规则 ${r.stats.rules}`,
-          `- 页面：${r.htmlPath}`,
+          `- 页面（按 auto-layout 出 flex）：${r.htmlPath}`,
+          `- 绝对定位对照页（归因用）：${r.absHtmlPath}`,
           r.specPath ? `- 规格/映射表：${r.specPath}` : '',
+          `- 属性来源台账：${r.coveragePath}（${model.coverage.summary}）`,
+          `- 布局推演：容器 ${r.stats.flexContainers} 个，与设计坐标不一致的子项 ${r.stats.flexMismatches} 条 → ${r.layoutReportPath}`,
+          r.stats.borderFallbacks
+            ? `  ⚠️ ${r.stats.borderFallbacks} 个节点（非均匀虚线）回落到真 CSS border：这些容器的流内子项会偏 1–2px，已标 data-src="border-fallback" 并记进 coverage.json`
+            : '',
+          r.stats.flexMismatches ? '  ⚠️ 有 mismatch：说明"按 auto-layout 推出来的 flex"无法完全复现设计坐标，先核对 SPEC 的 layout 列，别把它当实现问题。' : '',
           ...pngLines,
           '',
           `- 流程状态：${join(outDir, 'flow.json')}（confirmed=false）`,
@@ -394,23 +402,56 @@ export function apply(ctx: Context, config: Config): void {
         const prev = await readFlow(dir)
         if (!prev) throw new Error(`找不到 ${join(dir, 'flow.json')}：先跑 figma_render_static（或 figma_change_brief）`)
         if (args.reset) {
-          const next = await writeFlow(dir, { stage: prev.stage, nodeId: prev.nodeId, fileKey: prev.fileKey, confirmed: false, confirmedBy: undefined, confirmedAt: undefined, confirmNote: undefined })
+          const next = await writeFlow(dir, { stage: prev.stage, nodeId: prev.nodeId, fileKey: prev.fileKey, confirmed: false, confirmedBy: undefined, confirmedAt: undefined, confirmNote: undefined, knownDiffs: [] })
           return `♻️ 已撤销基准页确认（${dir}）\n- 当前 confirmed=${next.confirmed}；改完设计稿请重新渲染并再次确认。`
         }
+        if (prev.baselineRenderer !== 2) {
+          throw new Error([
+            `拒绝确认：${join(dir, 'flow.json')} 不是当前渲染器产出的基准页（baselineRenderer=${prev.baselineRenderer ?? '缺失'}）。`,
+            '旧渲染器产出的页面不能靠一次确认解封成权威基准（它可能缺 abs.html / coverage / flex 布局）。',
+            `请重新跑 figma_render_static(output_dir="${dir}")，再看页面确认。`,
+          ].join('\n'))
+        }
         const note = [args.note, args.diffs ? `已知差异：${args.diffs}` : ''].filter(Boolean).join(' | ')
+        // known-diffs：把"已接受的差异"变成结构化条目 → 后续评审命中即标 accepted（不再重复提出）
+        const nowIso = new Date().toISOString()
+        const knownDiffs: KnownDiff[] = String(args.diffs ?? '')
+          .split(/[,，;；、]/)
+          .map((x) => x.trim())
+          .filter(Boolean)
+          .map((x) => {
+            const m = /^(\d{1,6}:\d{1,6})\s*(.*)$/.exec(x)
+            return m ? { nodeId: m[1], property: m[2] || undefined, note: x, at: nowIso } : { property: x, note: x, at: nowIso }
+          })
         const via = args.via === 'expert_review' ? 'expert_review' : 'human'
+        // 人工确认基准 = 接受基准当前形态：把 open 的 baseline 条目一并标 accepted，
+        // 否则"确认了但 baselineDebt 未清"会让 figma_gen_component 永久拒绝（死锁）
+        const reviews = (prev.reviews ?? []).map((r) => {
+          if ((r.scope ?? 'implementation') !== 'baseline') return r
+          return {
+            ...r,
+            items: r.items.map((it) => (it.status === 'open'
+              ? { ...it, status: 'accepted' as const, closedBy: args.by || 'user', closedAt: new Date().toISOString(), closedNote: '随基准确认一并接受' }
+              : it)),
+          }
+        })
         const next = await writeFlow(dir, {
           stage: prev.stage, nodeId: prev.nodeId, fileKey: prev.fileKey,
+          gateVersion: GATE_VERSION,
+          reviews,
           confirmed: true,
           confirmedVia: via,
           confirmedBy: args.by || (via === 'expert_review' ? 'expert' : 'user'),
-          confirmedAt: new Date().toISOString(),
+          confirmedAt: nowIso,
           confirmNote: note || undefined,
+          knownDiffs,
         })
         return [
           `✅ 已记录基准页人工确认（设计 ${next.fileKey} · 节点 ${next.nodeId}）`,
           `- 确认来源：${next.confirmedVia ?? 'human'} · 确认人：${next.confirmedBy} · 时间：${next.confirmedAt}`,
           next.confirmNote ? `- 备注：${next.confirmNote}` : '',
+          knownDiffs.length ? `- 已登记已知差异 ${knownDiffs.length} 条（后续评审命中即标 accepted，不再重复提出）：${knownDiffs.map((k) => k.note).join('；')}` : '',
+          knownDiffs.length ? '  ⚠️ 只登记"确认要接受的差异"；能修的不要登记成 known-diff，否则等于把它变成永久豁免。' : '',
           `- 基准页：${next.staticPage ?? ''}`,
           `- 状态文件：${join(dir, 'flow.json')}`,
           '',
@@ -457,7 +498,8 @@ export function apply(ctx: Context, config: Config): void {
           L.push('|---|---|---|---|---|---|')
           for (const r of found.flow.reviews) {
             for (const it of r.items) {
-              L.push(`| ${it.id} | ${r.round} | ${it.severity} | ${it.status === 'open' ? '🔴 open' : '✅ closed'} | ${it.text.replace(/\|/g, '\\|').slice(0, 120)} | ${it.location ?? ''} |`)
+              const st = it.status === 'open' ? '🔴 open' : it.status === 'accepted' ? '🟡 accepted（已知差异）' : '✅ closed'
+              L.push(`| ${it.id} | ${r.round} | ${it.severity} | ${st} | ${it.text.replace(/\|/g, '\\|').slice(0, 120)} | ${it.location ?? ''} |`)
             }
           }
           const open = openItems(found.flow.reviews)
@@ -476,6 +518,18 @@ export function apply(ctx: Context, config: Config): void {
           if (!ids.length) throw new Error('close 需要指定条目 id（逗号分隔）或 all')
           const unknown = ids.filter((id) => !all.some((i) => i.id === id))
           if (unknown.length) throw new Error(`找不到条目：${unknown.join(', ')}（可用 action=list 查看）`)
+          // 关闭 blocker/major 必须有"改在哪 + 实测值"：否则"关闭"这道闸门可以由被审方自己解除
+          const closing = all.filter((i) => ids.includes(i.id) && i.status === 'open')
+          const serious = closing.filter((i) => i.severity === 'blocker' || i.severity === 'major')
+          const noteText = String(args.note ?? '').trim()
+          const noteOk = /[:：]\d+/.test(noteText) || noteText.length >= 12
+          if (serious.length && !noteOk) {
+            throw new Error([
+              `拒绝关闭：${serious.map((i) => i.id).join(', ')} 是 blocker/major，close 时必须带 note（形如「文件:行 + 实测值」，长度≥12）。`,
+              'note 要写清"改在哪个文件哪一行 + 实测值"，例如：',
+              '  note="改在 src/Foo.tsx:88，实测 border-width=0 0 0 1px / border-radius=8px 0 0 8px"',
+            ].join('\n'))
+          }
           const now = new Date().toISOString()
           for (const r of found.flow.reviews) {
             for (const it of r.items) {
@@ -508,12 +562,16 @@ export function apply(ctx: Context, config: Config): void {
         const items: ReviewItem[] = explicit ?? parseReview(String(args.review ?? ''), {
           resolveBox: resolver ? resolver.resolve : undefined,
         })
+        // baseline：无级别条目按 major（fail-closed），必须在抑制/落盘/判定之前
+        normalizeBaselineSeverity(items, scopeArg)
         // 显式给了 node_id 但没给 box 的，也补上坐标
         for (const it of items) {
           if (!it.box && it.nodeId && resolver) it.box = resolver.resolve(it.nodeId)
         }
-        if (!items.length) {
-          throw new Error('没能从 review 里解析出任何条目。请把清单写成列表/表格，或用 items 传结构化 JSON（JSON.parse 后的数组）')
+        // 允许"干净的一轮"：解析出 0 条时落一条 emptyRound 记录（否则"专家认为没问题"既无法登记、又满足不了门禁）
+        const emptyRound = items.length === 0
+        if (emptyRound && !String(args.review ?? '').trim()) {
+          throw new Error('没能从 review 里解析出任何条目，且没有原文可判断：请把清单写成列表/表格，或用 items 传结构化 JSON。')
         }
         const round = (await readRound(recordDir)) + 1
         const at = new Date().toISOString()
@@ -521,7 +579,18 @@ export function apply(ctx: Context, config: Config): void {
         // 条目 id 必须**跨轮唯一**：否则第 2 轮的 R1 与第 4 轮的 R1 会互相误关。
         // 统一改成 `<轮次>.<序号>`，并在输出里回显让调用方照抄。
         for (let i = 0; i < items.length; i++) items[i] = { ...items[i], id: `${round}.${i + 1}` }
-        const block = renderReviewRound(items, { round, reviewer, at, source: args.source, extra: args.review })
+        // known-diffs 抑制：命中"已确认接受的差异"的条目不进 Prompt、不参与判定，只记录为 accepted
+        // known-diffs 抑制的三条硬约束（否则它能把整轮评审吞掉、让 confirmed 再次恒真）：
+        //   ① blocker 永不抑制；② known-diff 只能压 minor/info；③ 压制后至少留一条有效条目。
+        const knownDiffs = found?.flow.knownDiffs ?? []
+        const suppressible = items.filter((it) => isSuppressible(it))
+        const suppressed = new Map<string, KnownDiff>()
+        for (const it of suppressible) {
+          const k = matchKnownDiff(it, knownDiffs)
+          if (k) suppressed.set(it.id, k)
+        }
+        const effective = items.filter((it) => !suppressed.has(it.id))
+        const block = renderReviewRound(effective, { round, reviewer, at, source: args.source, extra: args.review })
         if (genDir) {
           const promptPath = join(genDir, 'CODEGEN_PROMPT.md')
           await writeFile(promptPath, `${await readFile(promptPath, 'utf8')}\n${block}`, 'utf8')
@@ -529,15 +598,20 @@ export function apply(ctx: Context, config: Config): void {
         await mkdir(recordDir, { recursive: true })
         await writeFile(join(recordDir, '.codegen-round'), String(round), 'utf8')
 
-        const state: ReviewItemState[] = items.map((it) => ({ ...it, status: 'open' }))
+        const state: ReviewItemState[] = items.map((it) => ({
+          ...it,
+          status: suppressed.has(it.id) ? 'accepted' : 'open',
+          closedNote: suppressed.has(it.id) ? `命中 known-diff：${suppressed.get(it.id)?.note ?? ''}` : undefined,
+        }))
         const scope = scopeArg
-        const verdict = verdictOf(items)
+        // 空轮（0 条）不能算 pass 以外的任何判定；有条目但全被 accepted 也不许判 pass
+        const verdict: 'pass' | 'reject' = effective.length ? verdictOf(effective) : (emptyRound ? 'pass' : 'reject')
 
         // ── 标出有问题的地方：把问题按 id 钉在设计基准图上 ──
         let annotatedImage: string | undefined
         if (resolver) {
           const imgFile = 'index.png'
-          const annos: AnnotationInput[] = items.map((it) => ({
+          const annos: AnnotationInput[] = effective.map((it) => ({
             id: it.id, severity: it.severity, text: it.text,
             box: it.box ?? null, location: it.location,
           }))
@@ -555,19 +629,25 @@ export function apply(ctx: Context, config: Config): void {
           })
           if (png.ok) annotatedImage = png.path
         }
-        const reviews = [...(found?.flow.reviews ?? []), { round, reviewer, at, source: args.source, scope, verdict, annotatedImage, items: state } as ReviewRoundState]
-        await writeFlow(flowDir, {
+        const reviews = [...(found?.flow.reviews ?? []), { round, reviewer, at, source: args.source, scope, verdict, annotatedImage, items: state, emptyRound } as ReviewRoundState]
+        // 门禁修正：只有「基准审计（scope=baseline）判定 pass」才算基准已确认。
+        // 旧实现是 `confirmed: found?.flow.confirmed ? true : true`（恒真）——
+        // 任何一次评审（含 implementation、含 reject）都会把基准标成"已确认"，门禁形同虚设。
+        const confirmedNow = scope === 'baseline' && verdict === 'pass' && effective.length > 0
+        const flowPatch: Partial<FlowState> & Pick<FlowState, 'stage' | 'nodeId' | 'fileKey'> = {
           stage: found?.flow.stage ?? 'skeleton_generated',
           nodeId: found?.flow.nodeId ?? '',
           fileKey: found?.flow.fileKey ?? '',
           reviews,
-          // 流程约定：走完 UI 专家审计，就不再要求人工再确认一遍基准页。
-          // 但"谁把的关"必须留痕：confirmedVia 记 expert_review，confirmedBy 记专家名。
-          confirmed: found?.flow.confirmed ? true : true,
-          confirmedVia: found?.flow.confirmedVia ?? 'expert_review',
-          confirmedBy: found?.flow.confirmedBy ?? `expert:${reviewer}`,
-          confirmedAt: found?.flow.confirmedAt ?? at,
-        })
+        }
+        if (confirmedNow) {
+          // 谁把的关必须留痕：confirmedVia=expert_review，confirmedBy=专家名
+          flowPatch.confirmed = true
+          flowPatch.confirmedVia = 'expert_review'
+          flowPatch.confirmedBy = `expert:${reviewer}`
+          flowPatch.confirmedAt = at
+        }
+        await writeFlow(flowDir, flowPatch)
 
         // 落一份人可读的评审记录
         await mkdir(recordDir, { recursive: true })
@@ -605,10 +685,13 @@ export function apply(ctx: Context, config: Config): void {
           `- 评审记录：${join(recordDir, `round-${round}.md`)}`,
           `- ${verdict === 'reject' ? '打回清单' : '通过记录'}：${rejectPath}`,
           annotatedImage ? `- 标注图（问题已按 id 钉在基准图上）：${annotatedImage}` : '- 标注图：未生成（缺少 static/spec.json 或没有可解析的坐标）',
-          `- 审计对象：${scope} · 状态：${summarizeRounds(reviews)}`,
+          `- 审计对象：${scope} · 判定：${verdict} · 状态：${summarizeRounds(reviews)}`,
+          suppressed.size ? `- known-diffs 命中 ${suppressed.size} 条（已标 accepted，不再重复提出；blocker 不参与抑制）：${[...suppressed.keys()].join(', ')}` : '',
           scope === 'baseline'
-            ? '✅ 已按流程约定把"设计基准已审计"记入 flow.json（confirmedVia=expert_review），无需人工再确认基准页。'
-            : '✅ 已记录实现审计；收尾门禁还要求：无未关闭整改项 + 至少一轮专家审计（本轮已满足）。',
+            ? (confirmedNow
+              ? '✅ 基准审计 pass → flow.json 记为已确认（confirmedVia=expert_review），无需人工再确认基准页。'
+              : '❌ 基准审计未 pass → 基准仍为**未确认**（confirmed 保持 false）：按上面条目修基准页后，重新提审一轮拿 pass。')
+            : '✅ 已记录实现审计（不改动基准确认状态）；收尾门禁还要求：实现侧无未关闭项 + 至少一轮实现审计。',
           '',
           '解析结果（请核对，解析错了就用 items 传结构化 JSON 重来）：',
           ...items.slice(0, 20).map((it) => `  - [${it.id}/${it.severity}] ${it.text.slice(0, 90)}${it.location ? `  @${it.location}` : ''}`),
@@ -670,6 +753,7 @@ export function apply(ctx: Context, config: Config): void {
         static_page: { type: 'string', description: 'figma_render_static 生成的 index.html（视觉基准，写进 Prompt 要求截图对照）' },
         code_dir: { type: 'string', description: '目标项目目录：用于探测项目组件约定（组件放哪、什么形态、样式后缀），新组件按项目实际落点生成' },
         max_extract: { type: 'number', description: '最多抽几个可复用组件（默认 3；从设计里的重复结构统计得出）' },
+        skip_static_check: { type: 'boolean', description: 'true = 跳过"必须有视觉基准页"的硬门禁（只想要几何数据时用；会留痕）' },
         round: { type: 'number', description: '生成轮次（默认 1）' },
         round_feedback: { type: 'string', description: '上一轮反馈（round>1）' },
       },
@@ -699,6 +783,22 @@ export function apply(ctx: Context, config: Config): void {
             '如果你确实要跳过（例如只是想要几何数据），显式传 skip_static_check=true。',
           ].join('\n'))
         }
+        // 【基准债务门禁】基准审计里还有未关闭的 blocker/major 时不许生成骨架：
+        // 两段式——先把基准修到 pass，再让实现去对齐它；否则实现永远在追一个错的基准。
+        const baselineFound = await findFlow(outDir)
+        const baselineDebt = openItems(baselineFound?.flow.reviews, 'baseline')
+          .filter((i) => i.severity === 'blocker' || i.severity === 'major')
+        if (baselineDebt.length) {
+          throw new Error([
+            `拒绝生成：设计基准还有 ${baselineDebt.length} 条未关闭的 blocker/major（scope=baseline）。`,
+            `  ${baselineDebt.slice(0, 5).map((i) => `[${i.id}/${i.severity}] ${i.text.slice(0, 60)}`).join('\n  ')}`,
+            '',
+            '基准是先修的：按条目修基准页 → 重新渲染基准 → 再提审基准（scope="baseline"）拿 pass，',
+            '然后才做实现。用 figma_review_to_round(action="close", scope="baseline") 关闭已修条目。',
+            `查看：figma_review_to_round(output_dir="${outDir}", action="list")`,
+          ].join('\n'))
+        }
+
         const model = buildDesignModel(nodeJson)
         const audit = auditModel(model)
         let auditMd = ''
@@ -782,63 +882,60 @@ export function apply(ctx: Context, config: Config): void {
         round_feedback: { type: 'string', description: '本轮 review/差异/截图对照结论（必填）' },
         requirements: { type: 'string', description: '需求（可省略）' },
         conventions: { type: 'string', description: '项目约定（可省略）' },
-        force: { type: 'boolean', description: 'true = 跳过"基准页已人工确认"的检查（默认拒绝）' },
+        force: { type: 'boolean', description: 'true = 显式越过收尾门禁（必须同时给 force_reason；会写入 flow.json 留痕）' },
+        force_reason: { type: 'string', description: 'force 的理由（必填，会写进 flow.json 并在输出里回显）' },
       },
       output: {
         schema: { type: 'string' },
         render: (_args: unknown, value: unknown) => [textBlock(String(value))],
       },
-      async execute(args: { output_dir: string; round_feedback: string; requirements?: string; conventions?: string; force?: boolean }) {
+      async execute(args: { output_dir: string; round_feedback: string; requirements?: string; conventions?: string; force?: boolean; force_reason?: string }) {
         const dir = resolve(args.output_dir)
         // 【硬门禁】收尾迭代要求基准页已经人工确认过：迭代是"声称做完"的前一步，
         // 没人确认过基准就迭代，等于对着未确认的目标收敛。
         const found = await findFlow(dir)
-        if (!args.force && found) {
-          // 【主流程】涉及 UI 的交付必须走过一轮 UI 专家审计
-          if (found.flow.expertReviewRequired !== false && !hasExpertReview(found.flow.reviews)) {
+        // 门禁集中判定（gate.ts，可单测）。fail-closed：旧目录 / 缺 flow.json / 未确认 一律拒绝。
+        const staticPageOk = !!found?.flow.staticPage && existsSync(found.flow.staticPage)
+        const specOk = existsSync(join(found?.dir ?? dir, 'static', 'spec.json'))
+        const gate = evaluateCloseGate({
+          flow: found?.flow ?? null,
+          gateVersion: GATE_VERSION,
+          force: args.force,
+          forceReason: args.force_reason,
+          artifacts: { staticPage: staticPageOk, spec: specOk },
+        })
+        if (!gate.ok) {
+          const reason = gate.reason ?? '门禁未通过'
+          if (reason.includes('实现审计')) {
             throw new Error([
-              '拒绝收尾：这个流程要求涉及 UI 的交付先经过一轮 **UI 专家审计**，但 flow.json 里还没有任何评审记录。',
+              `拒绝收尾：${reason}`,
               '',
               '照下面做（主 agent 负责叫专家；专家看不到你的上下文，**必须把路径原样抄进任务书**）：',
               '  1) summon_expert("UI 视觉验收设计师", 任务) —— 任务里带：',
-              `     设计基准图 ${join(found.dir, 'static', 'index@2x.png')}（用 read_image 读图）`,
-              `     设计规格 ${join(found.dir, 'static', 'SPEC.md')}`,
+              `     设计基准图 ${join(found?.dir ?? dir, 'static', 'index@2x.png')}（用 read_image 读图）`,
+              `     设计规格 ${join(found?.dir ?? dir, 'static', 'SPEC.md')}`,
               '     组件实现截图（同尺寸/缩放）',
               '     "逐条给出 问题/位置/期望/实际/级别(blocker|major|minor)"',
-              `  2) figma_review_to_round(output_dir="${found.dir}", review=<专家原文>, reviewer="UI 视觉验收设计师")`,
-              '  3) 按条目改 → action="close" 逐条关闭',
+              '  2) 先跑机器对照（可选但推荐）：figma_visual_diff(output_dir=…, impl=<实现页路径>)',
+              '     → 得到的 items 可直接传给 figma_review_to_round（免自然语言解析）',
+              `  3) figma_review_to_round(output_dir="${found?.dir ?? dir}", review=<专家原文>, reviewer="UI 视觉验收设计师")`,
+              '  4) 按条目改 → action="close" 逐条关闭（blocker/major 必须带 note: 文件:行 + 实测值）',
               '',
-              '若当前环境没有可用的 UI 专家（Agency 设置里未启用），可传 force=true 显式越过；会留痕在 flow.json 里，交付时须注明「未经专家审计」。',
+              '若当前环境没有可用的 UI 专家（Agency 设置里未启用），可传 force=true 显式越过；会留痕，交付时须注明「未经专家审计」。',
             ].join('\n'))
           }
-          const rounds = found.flow.reviews ?? []
-          const last = rounds[rounds.length - 1]
-          if (last && last.verdict === 'reject') {
-            throw new Error([
-              `拒绝收尾：第 ${last.round} 轮 UI 专家审计的判定是 **reject（打回）**。`,
-              'blocker/major 修复并逐条关闭后，必须**再提审一轮**拿到 pass（复审），才允许收尾 —— 开发自述"改完了"不算通过。',
-              `复审：summon_expert("UI 视觉验收设计师", 带新的组件截图 + 基准图) → figma_review_to_round(...)`,
-              '确实要越过请显式传 force=true。',
-            ].join('\n'))
-          }
-          const open = openItems(found.flow.reviews)
-          if (open.length) {
-            const sev = openByeSeverity(found.flow.reviews)
-            throw new Error([
-              `拒绝收尾：还有 ${open.length} 条专家整改项未关闭（阻断 ${sev.blocker} / 主要 ${sev.major} / 次要 ${sev.minor}）。`,
-              `用 figma_review_to_round(output_dir="${found.dir}", action="list") 看清单，`,
-              `改完逐条关闭：action="close", close="${open.slice(0, 3).map((i) => i.id).join(',')}"。`,
-              '确实要越过请显式传 force=true。',
-            ].join('\n'))
+          throw new Error(`拒绝收尾：${reason}\n确需越过请显式传 force=true 且给 force_reason（会写进 flow.json 留痕）。`)
+        }
+        if (gate.forced) {
+          // force 不是"无痕放行"：写进 flow.json，并在这里回显，交付说明必须带上
+          if (found) {
+            await writeFlow(found.dir, {
+              stage: found.flow.stage, nodeId: found.flow.nodeId, fileKey: found.flow.fileKey,
+              forcedAt: new Date().toISOString(), forcedBy: 'agent', forceReason: String(args.force_reason ?? '').trim(),
+            })
           }
         }
-        if (!args.force && found && !found.flow.confirmed) {
-          throw new Error([
-            `拒绝迭代：${join(found.dir, 'flow.json')} 里 confirmed=false（基准页还没有人工确认）。`,
-            `请先让用户确认 ${found.flow.staticPage ?? 'static/index.html'}，再调用 figma_confirm_static(output_dir="${found.dir}")；`,
-            '确实要越过请显式传 force=true。',
-          ].join('\n'))
-        }
+
         const promptPath = join(dir, 'CODEGEN_PROMPT.md')
         if (!existsSync(promptPath)) throw new Error(`找不到 ${promptPath}，先运行 figma_gen_component`)
         const roundPath = join(dir, '.codegen-round')
@@ -871,6 +968,92 @@ export function apply(ctx: Context, config: Config): void {
         ].join('\n')
       },
     })))
+    // ── 工具 4：自动视觉回归（把"肉眼找差异"换成可断言的数值差） ──
+    disposers.push(ctx.tools.register(defineTool({
+      name: 'figma_visual_diff',
+      description: '自动视觉回归：用无头 Chrome 打开**组件实现页**，逐节点取 getBoundingClientRect + computed style，与设计规格（static/spec.json）比对，产出 expected/actual/Δ 的结构化差异（可直接作为 figma_review_to_round 的 items）。只对照可机器判定的属性：位置/尺寸/逐边描边/圆角/背景色/字号/行高。实现页需是 file:// 可打开的静态页（http 站点因跨域拿不到 computed style）',
+      parameters: {
+        output_dir: { type: 'string', description: '输出目录（含 flow.json 与 static/spec.json）' },
+        impl: { type: 'string', description: '组件实现页：本地 HTML 路径，或可 file:// 打开的静态页；不要传 dev server 的 http 地址' },
+        tolerance: { type: 'number', description: '可接受偏差（px），默认 1' },
+        chrome_bin: { type: 'string', description: '无头浏览器路径（缺省自动探测）' },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_args: unknown, value: unknown) => [textBlock(String(value))],
+      },
+      async execute(args: { output_dir: string; impl: string; tolerance?: number; chrome_bin?: string }) {
+        const dir = resolve(args.output_dir)
+        const found = await findFlow(dir)
+        const flowDir = found?.dir ?? dir
+        const staticDir = join(flowDir, 'static')
+        const specPath = join(staticDir, 'spec.json')
+        if (!existsSync(specPath)) {
+          throw new Error(`找不到 ${specPath}：先跑 figma_render_static（它会产出 spec.json / coverage.json / abs.html）`)
+        }
+        const spec = JSON.parse(await readFile(specPath, 'utf8')) as {
+          width: number; height: number
+          rows: Array<{ id: string; name: string; kind: string; x: number; y: number; w: number; h: number; background?: string; borderEdges?: string; radius?: string; font?: string; dash?: string }>
+        }
+        const implArg = String(args.impl ?? '').trim()
+        if (!implArg) throw new Error('需要 impl：组件实现页路径')
+        const isHttp = /^https?:\/\//i.test(implArg)
+        if (!isHttp && !existsSync(resolve(implArg))) {
+          throw new Error(`实现页不存在：${resolve(implArg)}（需要先构建/导出成静态页；dev server 的 http 地址拿不到 computed style）`)
+        }
+        const impl = isHttp ? implArg : pathToFileURL(resolve(implArg)).href
+        const rows = spec.rows as SpecRowLite[]
+        const res = await visualDiff({
+          implPathOrUrl: impl,
+          width: spec.width,
+          height: spec.height,
+          tolerance: Number.isFinite(Number(args.tolerance)) ? Number(args.tolerance) : 1.5,
+          outDir: staticDir,
+          rows,
+          chromeBin: args.chrome_bin,
+        })
+        if (!res.ok) {
+          return [
+            `⚠️ 自动视觉回归没能执行：${res.error ?? '未知错误'}`,
+            '',
+            '常见原因：',
+            '  1) 实现页不是 file:// 可打开的静态页（React dev server 的 http 地址拿不到 computed style）；',
+            '  2) 实现页没有给元素打 data-design-id（骨架生成时会带，手写页面需自行加）；',
+            '  3) 本机没有可用的 Chrome/Chromium（可用 chrome_bin 指定）。',
+            '此时请退回"截图 + 人/专家肉眼审计"，并在交付说明里注明"未经机器回归"。',
+          ].join('\n')
+        }
+        const sev = { blocker: 0, major: 0, minor: 0 } as Record<string, number>
+        for (const f of res.findings) sev[f.severity] = (sev[f.severity] ?? 0) + 1
+        const items = res.findings.map((f) => ({
+          severity: f.severity,
+          text: `[${f.property}] ${f.name}：期望 ${f.expected} · 实际 ${f.actual}${f.delta != null ? ` · Δ${f.delta}` : ''}`,
+          node_id: f.nodeId,
+          expected: f.expected,
+          actual: f.actual,
+        }))
+        const shown = items.slice(0, 60)
+        const itemsJson = JSON.stringify(shown)
+        const truncated = items.length > shown.length
+        return [
+          `🔬 自动视觉回归：对照 ${res.checked} 个节点，差异 ${res.findings.length} 条`
+            + `（阻断 ${sev.blocker ?? 0} / 主要 ${sev.major ?? 0} / 次要 ${sev.minor ?? 0}）`
+            + (res.missing.length ? ` · 实现页缺少 ${res.missing.length} 个节点` : ''),
+          `- 报告：${res.reportPath}`,
+          `- 机器可读：${res.jsonPath}`,
+          res.missing.length ? `- 缺失节点示例：${res.missing.slice(0, 5).join('；')}${res.missing.length > 5 ? ' …' : ''}` : '',
+          truncated ? `- ⚠️ 条目过多：只回传前 ${shown.length} 条（共 ${items.length} 条），完整清单见 visual-diff.json` : '',
+          '',
+          res.findings.length
+            ? '把差异接进闭环（免自然语言解析，推荐）：'
+              + `\n  figma_review_to_round(output_dir="${flowDir}", items=${itemsJson}, reviewer="figma_visual_diff", scope="implementation")`
+            : '✅ 可比属性全部在容差内：机器层面没有位移/尺寸/描边/圆角/字号偏差，剩下的交给人与专家的意图判断。',
+          '',
+          '注意：机器只能判"数值差"；视觉层级、信息密度、文案、设计意图仍要靠 UI 专家审计（figma_codegen_round 的门禁不认这一层）。',
+        ].filter(Boolean).join('\n')
+      },
+    })))
+
     return disposers
   }, '@deepseek-ai/dsh-tool-design-to-code')
 }

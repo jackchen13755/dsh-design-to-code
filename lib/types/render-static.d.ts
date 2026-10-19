@@ -1,4 +1,4 @@
-import type { DesignModel, DesignNode } from './design.js';
+import type { CoverageReport, DesignModel, DesignNode } from './design.js';
 export interface StaticRenderOptions {
     outputDir: string;
     /** 组件/页面名（用于标题） */
@@ -7,6 +7,23 @@ export interface StaticRenderOptions {
     projectName?: string;
     /** 是否输出 SPEC.md（默认 true） */
     spec?: boolean;
+}
+export interface StaticRenderResult {
+    htmlPath: string;
+    /** 全绝对定位的对照页（旧行为，用于 diff 归因） */
+    absHtmlPath: string;
+    specPath?: string;
+    specJsonPath: string;
+    coveragePath: string;
+    layoutReportPath: string;
+    stats: {
+        nodes: number;
+        rules: number;
+        instances: number;
+        flexContainers: number;
+        flexMismatches: number;
+        borderFallbacks: number;
+    };
 }
 interface Ds {
     line: string;
@@ -25,7 +42,6 @@ interface Ds {
  * - 'rightEnd' 右端格 → **左侧两角方**
  * 规则是**结构性的**：同一行内子项水平相邻且间距 ≤1px（重叠 1px 或 0 间隙）就算拼接；
  * 与设计是否显式写了 0px 无关（很多实例的 radius 字段就是空的）。
- * 上一版只处理了"中间格"且只在 3 格行生效，专家复审实测出右端格（132:9306/132:9324）仍带全圆角。
  */
 export type JoinRole = 'mid' | 'leftEnd' | 'rightEnd';
 export declare function joinRoleOf(n: DesignNode): JoinRole | undefined;
@@ -33,16 +49,7 @@ export declare function joinRoleOf(n: DesignNode): JoinRole | undefined;
 export declare function inferDesignSystem(model: DesignModel): Ds;
 /** 生成 SPEC.md：设计规格 + 到项目 token 的映射表（右列由人/会话填） */
 export declare function renderSpecMarkdown(model: DesignModel, ds: Ds, projectName?: string): string;
-export declare function renderStatic(model: DesignModel, opts: StaticRenderOptions): {
-    htmlPath: string;
-    specPath?: string;
-    specJsonPath: string;
-    stats: {
-        nodes: number;
-        rules: number;
-        instances: number;
-    };
-};
+export declare function renderStatic(model: DesignModel, opts: StaticRenderOptions): StaticRenderResult;
 /** 供 codegen 复用的摘要行（把规格表塞进 Codegen Prompt） */
 export declare function specTable(model: DesignModel, limit?: number): string;
-export {};
+export type { CoverageReport };

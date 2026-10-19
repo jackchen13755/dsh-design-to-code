@@ -11,21 +11,39 @@
  *    不能当"有描边"的证据；要看 `strokePaints`/`strokeGeometry`。
  * 3. 描边可能是**逐边**的：`borderStrokeWeightsIndependent=true` + `borderLeft/Right/Top/BottomWeight`。
  *    设计稿"只有左边框"就是这么表达的，统一按 strokeWeight 读会变成四边框。
+ *    **特别注意**：逐边标记为 true 但四边全 0 时**不能再回落 strokeWeight**（那会凭空长出一条边框，
+ *    实测 96 个实例里 87 个被这么画出了设计里不存在的 1px 边框）。只有 `strokeGeometry` 存在时才回落。
  * 4. 圆角可能是**逐角**的：`rectangleCornerRadiiIndependent` + `rectangle*CornerRadius`。
  *    拼接控件组"两端圆角 8、中间直角"就靠它。
  * 5. 实例（INSTANCE）在 ws.json 里**没有 children、没有 fillPaints/strokePaints**：内部结构拿不到。
  *    能拿到的只有 size / cornerRadius / 逐角圆角 / 以及**覆写文案**
  *    `symbolData.symbolOverrides[].textData.characters`（如 "Please Input"）。
- * 6. auto-layout 的 `stackMode/stackSpacing/stackPadding*` 都在数据里，
- *    绝对定位只是"静态还原"的手段；落到组件时应转成 flex（见 render-static / codegen）。
+ * 6. auto-layout 的 `stack*` 字段都在数据里，绝对定位只是"静态还原"的手段；
+ *    落到组件时应转成 flex。**只读 stackMode/spacing/padding 是不够的**——
+ *    `stackPrimaryAlignItems / stackCounterAlignItems / stackPrimarySizing / stackCounterSizing /
+ *    stackChildPrimaryGrow / stackChildAlignSelf / stackWrap / stackPositioning` 决定
+ *    "谁吸收剩余空间、怎么对齐、要不要换行、是不是绝对子项"，缺了这些，flex 只能靠模型脑补。
+ *
+ * ── 属性来源（provenance）──
+ * 每个节点记录每个视觉属性的来源：design（设计数据直读）/ inferred（由数据推断）/ placeholder（数据缺失，占位重建）。
+ * 基准页、SPEC、coverage.json 都读它 —— 让"猜出来的部分"从隐性负债变成显性台账，
+ * 评审时可以直接说"这处是 placeholder，不是实现做错了"，不必每轮重新争论。
  */
+export type Prov = 'design' | 'inferred' | 'placeholder';
 export interface DesignTextStyle {
     family: string;
     size: number;
     weight: number;
+    italic?: boolean;
     lineHeight?: string;
     letterSpacing?: string;
+    /** 水平对齐（LEFT/CENTER/RIGHT/JUSTIFIED → css） */
     align?: string;
+    /** 垂直对齐（TOP/CENTER/BOTTOM）——决定文字贴顶还是居中 */
+    alignVertical?: string;
+    /** NONE/WIDTH_AND_HEIGHT/HEIGHT/TRUNCATE：决定"该不该按设计框换行" */
+    autoResize?: string;
+    maxLines?: number;
     color?: string;
 }
 export interface DesignBorder {
@@ -34,7 +52,16 @@ export interface DesignBorder {
     right: number;
     bottom: number;
     left: number;
+    /** 虚线样式（Kiwi dashPattern，如 [2,2]）——不读它会把虚线画成实线 */
+    dash?: number[];
+    /** INSIDE | OUTSIDE | CENTER（默认 INSIDE） */
+    align?: string;
 }
+/**
+ * auto-layout 归一。
+ * 前半段（mode/spacing/padding/primaryAlign/counterAlign/sizing/wrap）描述**自己这个容器**；
+ * 后半段（childGrow/childAlignSelf/absolute）描述**自己在父容器里**的行为。
+ */
 export interface DesignLayout {
     mode?: string;
     spacing?: number;
@@ -42,7 +69,23 @@ export interface DesignLayout {
     paddingRight?: number;
     paddingBottom?: number;
     paddingLeft?: number;
+    /** 主轴对齐：MIN | CENTER | MAX | SPACE_BETWEEN */
+    primaryAlign?: string;
+    /** 交叉轴对齐：MIN | CENTER | MAX | BASELINE */
     counterAlign?: string;
+    /** FIXED | RESIZE_TO_FIT | RESIZE_TO_FIT_WITH_IMPLICIT_SIZE */
+    primarySizing?: string;
+    counterSizing?: string;
+    /** NO_WRAP | WRAP */
+    wrap?: string;
+    /** 自己在父 auto-layout 里的拉伸权重（0/1） */
+    childGrow?: number;
+    /** 自己在父容器交叉轴上的对齐：AUTO | STRETCH | ... */
+    childAlignSelf?: string;
+    /** 自己是否被绝对定位在父 auto-layout 里（不能参与 flex 流） */
+    absolute?: boolean;
+    /** 边框是否占空间（影响 padding 计算） */
+    bordersTakeSpace?: boolean;
 }
 export interface DesignTokens {
     colors: Record<string, string>;
@@ -56,15 +99,16 @@ export interface DesignTokens {
     spacing: number[];
     shadows: string[];
 }
+export type NodeKind = 'root' | 'frame' | 'text' | 'input' | 'button' | 'icon' | 'instance' | 'ellipse' | 'other';
 export interface DesignNode {
     id: string;
     type: string;
     name: string;
-    kind: 'root' | 'frame' | 'text' | 'input' | 'button' | 'icon' | 'instance' | 'other';
-    /** 相对**父节点**的坐标（保留原始语义，自绘 HTML 用） */
+    kind: NodeKind;
+    /** 相对**父节点**的坐标（嵌套渲染 / flex 流里的绝对子项用） */
     rx: number;
     ry: number;
-    /** 相对**根节点**画布原点的坐标（已归零，绝对定位与规格表用） */
+    /** 相对**根节点**画布原点的坐标（已归零；扁平绝对定位与规格表用） */
     x: number;
     y: number;
     w: number;
@@ -75,12 +119,18 @@ export interface DesignNode {
     /** 已归一成 CSS 的圆角，如 "8px" / "8px 0px 0px 8px" */
     radius?: string;
     shadow?: string;
+    /** 旋转角（度，来自 transform 矩阵）——0 之外才写 transform */
+    rotation?: number;
+    /** 容器是否裁剪子元素（Figma clipsContent / frameMaskDisabled） */
+    clips?: boolean;
     /** TEXT：可见文字；INSTANCE：从覆写链取到的文案 */
     value?: string;
     text?: DesignTextStyle;
     layout?: DesignLayout;
     /** INSTANCE 内部结构在 ws.json 中缺失（无 children / 无填充描边）→ 必须用项目组件重建 */
     instanceInternalMissing?: boolean;
+    /** 每个视觉属性的来源：design / inferred / placeholder */
+    prov?: Record<string, Prov>;
     children: DesignNode[];
     raw: Record<string, any>;
 }
@@ -88,7 +138,7 @@ export interface DesignSpecRow {
     id: string;
     name: string;
     type: string;
-    kind: DesignNode['kind'];
+    kind: NodeKind;
     x: number;
     y: number;
     w: number;
@@ -97,11 +147,22 @@ export interface DesignSpecRow {
     border?: string;
     radius?: string;
     borderEdges?: string;
+    /** 文本颜色（TEXT 节点的 fillPaints；别和背景混为一谈） */
+    color?: string;
+    /** 虚线样式，如 "2,2" */
+    dash?: string;
+    /** INSIDE / OUTSIDE / CENTER */
+    strokeAlign?: string;
     font?: string;
     text?: string;
     layout?: string;
+    /** 完整的行内 auto-layout 描述（含 grow/align-self/wrap） */
+    layoutFull?: string;
     shadow?: string;
+    clips?: boolean;
     instanceInternalMissing?: boolean;
+    /** 属性来源汇总，如 "fill=design,stroke=design,instance=placeholder" */
+    prov?: string;
 }
 export interface DesignModel {
     fileKey: string;
@@ -122,17 +183,55 @@ export interface DesignModel {
     tree: DesignNode;
     /** 扁平规格表（逐节点一行），审计/Prompt/对照表都用它 */
     spec: DesignSpecRow[];
+    /** 属性来源台账（P3）：按 design/inferred/placeholder 统计 + 逐节点明细 */
+    coverage: CoverageReport;
+}
+export interface CoverageReport {
+    /** 总节点数（不含隐藏） */
+    nodes: number;
+    /** 各来源的"属性项"计数 */
+    counts: {
+        design: number;
+        inferred: number;
+        placeholder: number;
+    };
+    /** placeholder 占全部属性项的比例（0-1） */
+    placeholderRatio: number;
+    /** 逐项：哪个节点哪个属性是 placeholder / inferred */
+    entries: Array<{
+        id: string;
+        name: string;
+        property: string;
+        prov: Prov;
+    }>;
+    /** 用到的字体族（是否本机安装要在渲染时探测） */
+    fonts: string[];
+    /** 说明性摘要（写进 SPEC） */
+    summary: string;
 }
 type Any = Record<string, any>;
-/** fillPaints / strokePaints / 文字色 → CSS 颜色（只取第一个可见 SOLID） */
+/**
+ * fillPaints / strokePaints / 文字色 → CSS 颜色。
+ * 多个可见纯色叠加时取**最后一个**（Kiwi 的 paints 按绘制顺序，后者在上层）。
+ */
 export declare function paintToCss(list: Any[] | undefined): string | undefined;
 export declare function rgbToHex(rgb: number[]): string;
+/** 填充 → { css, prov }；IMAGE 拿不到位图资源，画中性底纹并标 placeholder */
+export declare function backgroundOf(n: Any): {
+    css?: string;
+    prov?: Prov;
+};
 /**
  * 逐边描边。关键：`borderStrokeWeightsIndependent=true` 时四条边独立，
  * 缺省的那几条是 **0**（不是继承 strokeWeight）。
+ * 只有存在 `strokeGeometry`（确实画了描边）时才允许回落到 strokeWeight。
  */
 export declare function borderOf(n: Any): DesignBorder | undefined;
-/** 逐角圆角 → CSS border-radius 值（TL TR BR BL），无圆角返回 undefined */
+/**
+ * 逐角圆角 → CSS border-radius 值（TL TR BR BL）。
+ * `rectangleCornerRadiiIndependent=true` 时四角就是**显式值**（全 0 也是显式 0），
+ * 不能再回落到 cornerRadius —— 否则拼接组中间格会凭空长出圆角。
+ */
 export declare function radiusOf(n: Any): string | undefined;
 export declare function shadowOf(n: Any): string | undefined;
 export declare function fontKeyOf(n: Any): string;
@@ -140,5 +239,7 @@ export declare function fontKeyOf(n: Any): string;
 export declare function instanceIsOpaque(n: Any, childCount: number): boolean;
 /** 实例里真正显示的文字藏在覆写链里（普通 TEXT 节点的 textData 拿不到） */
 export declare function overrideTextOf(n: Any): string | undefined;
+/** 扁平化（不含隐藏节点） */
+export declare function flatten(model: DesignModel): DesignNode[];
 export declare function buildDesignModel(nodeJson: Any): DesignModel;
 export {};

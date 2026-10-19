@@ -1,12 +1,13 @@
 {
   "name": "@deepseek-ai/dsh-tool-design-to-code",
-  "version": "0.1.4",
-  "description": "设计稿 → 1:1 静态还原页 / 审计清单 / 几何骨架 / 变更简报（改现有页面）—— 零外部依赖、零 REST",
+  "version": "0.2.0",
+  "description": "设计稿 → 1:1 静态还原页（auto-layout→flex）/ 审计清单 / 几何骨架 / 变更简报 + 覆盖面台账与自动视觉回归（零外部依赖、零 REST）",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/types/index.d.ts",
   "files": [
-    "lib"
+    "lib",
+    "scripts"
   ],
   "repository": {
     "type": "git",
@@ -30,6 +31,7 @@
   },
   "scripts": {
     "build": "bash scripts/build.sh",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "selftest": "node scripts/selftest.mjs"
   }
 }
