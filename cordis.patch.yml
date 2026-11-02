@@ -1,0 +1,9 @@
+# dsh-tool-design-to-code bundle patch: inserts the plugin row into the composition.
+#
+# 行 id 与 profile cordis.patch.yml 里手工补的那条保持一致（tool-design-to-code）——
+# 补丁层是「同 id 覆盖」，所以这里声明后仍由 profile 层按 id 覆盖，不会重复注册。
+# 声明 dsh.bundle.patch 的意义：让本插件不再需要依赖外置 patch 才能装配，
+# 也就不会在安装时被当作「未声明 dsh 元数据的普通依赖」从 bundles 里剪掉。
+- insert:
+    - id: tool-design-to-code
+      name: '@deepseek-ai/dsh-tool-design-to-code'
