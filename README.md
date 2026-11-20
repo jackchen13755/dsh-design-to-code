@@ -1,3 +1,15 @@
+## v0.3.0（真实 Roompedia 样例校准）
+
+以 `OfZXdKXERGyMGqkwgWOueg` 的 `110:854` 为新增回归样例（外部 Chrome 对照 Figma 实际画布）：
+
+- **Grid / WRAP**：`gridRows/Columns/Sizing` 生成 CSS Grid；换行容器按 `parentIndex.position` 排序并读取 `stackCounterSpacing`。不再把 Grid 当纵向 flex，也不按 x/y 重排第二行。
+- **实例文本**：读取全部覆写文字，并用 `derivedSymbolData` 补齐每段的字体、字号、字重、行高及局部几何；本例恢复 26 段文字，包括 Tab 文案与数字徽标，而非全部退化为 14px。
+- **图标用库原 SVG**：读取 Figma `iconify-props`（如 `akar-icons:sound-on`），缓存库中的 SVG 到 `static/assets` 并附 `icons.json`。**不解析路径自行描图**；没有明确库标识的节点仍显示占位并要求确认映射。
+- **徽标按证据渲染**：`derivedSymbolData` 里带 `strokeGeometry` 的徽标按描边胶囊渲染（描边/文字色仍标 `data-guessed`），不再一律画成浅色实底方块。
+- **数据可信**：有 manifest 时校验捕获的 Figma file key，拒绝把其他文件/读失败的画板猜成设计；`visible=false fill` 是明确隐藏，不再作为设计歧义。
+- **真实溢出修正**：零高线条的占位不再用四边 CSS border 撑高布局。此例曾造成录音文本整体下移 2px，只有浏览器实测才能发现。
+- **验证**：布局推演 `before 15 → after 0 mismatch`，Chrome 实际逐节点探针 0 差异。实例仍可能缺完整内部结构/前景色，台账不会把这些缺口伪标为完整还原。
+
 ## v0.2.0（多轮评审根因修复）
 
 这一版不是加功能，是修"为什么必须多轮评审"：
@@ -66,9 +78,11 @@ DSH 工具：**设计稿 → 可核对的视觉基准 / 审计清单 / 代码骨
    设计稿"只有左边框"就是这么表达的。
 4. **圆角可能是逐角的**：`rectangleCornerRadiiIndependent` + `rectangle*CornerRadius`。
    拼接控件组"两端圆角 8、中间直角"靠它。
-5. **实例（INSTANCE）在 ws.json 里没有 children、没有填充描边**：内部结构拿不到。
-   能拿到的是 size / 逐角圆角 / **覆写文案** `symbolData.symbolOverrides[].textData.characters`；
-   落实现时必须用项目既有组件重建，插件只给占位与规格。
+5. **实例（INSTANCE）在 ws.json 里经常没有 children、没有填充描边**：完整内部结构不保证能拿到。
+   可读取 size / 逐角圆角 / **全部覆写文案** `symbolData.symbolOverrides[].textData.characters`，并在有
+   `derivedSymbolData` 时补齐每段文本的字体与局部几何。恢复的部分标为 design，仍缺的部分显式标明 placeholder；
+   最终必须用项目既有组件重建，不能把重建占位当成完整实例树。
+   图标优先读 `pluginData[key=iconify-props]` 中的 Iconify 库标识，引用库原 SVG，不从路径数据自绘。
 6. **auto-layout 的 `stackMode/stackSpacing/stackPadding*` 都在数据里**：绝对定位只是静态还原的手段，
    落到组件时应转成 flex。
 
@@ -94,13 +108,14 @@ DSH 工具：**设计稿 → 可核对的视觉基准 / 审计清单 / 代码骨
 `figma_render_static` 默认同时导出 `static/index.png`（1x）与 `static/index@2x.png`（2x，1px 描边也看得清），
 用**无头 Chrome** 渲染静态还原页得到：尺寸精确、无编辑器浮层、可复现，且**不依赖 Figma 出图权限**
 （设计文件常被设成 "Export disabled"，走官方出图会直接失败）。
+检测到 `iconify-props` 的图标会把库原 SVG 缓存到 `static/assets`，所以已缓存后可离线复现；首次命中未缓存图标需要访问 Iconify 公共资源，失败会明确列出，不以自绘路径代替。完整清单见 `static/icons.json`。
 
 工具返回值里会附一段「交给 UI 专家的读图材料」，主 agent 转交时**原样抄进任务书**：
 设计基准图路径 + 基准页路径 + SPEC 路径 + 审计要求（逐条 问题/位置/期望/实际/级别）。
 
 两类图的定位要分清：
 - **设计基准图（本工具产出）**：与 SPEC 规格表同源 → 适合审计**结构/尺寸/逐边描边/逐角圆角/字体**；
-  实例（Input/Select/按钮）是按设计系统重建的占位，其内部细节不作为审计依据。
+  实例（Input/Select/按钮）缺失的内部细节不作为审计依据；`derivedSymbolData` 已恢复的文案字体/几何以 SPEC 为准。
 - **Figma 画布截图（figma_read_node_ws 产出）**：真实观感（图标、质感），但含编辑器浮层且裁剪不稳定 →
   只作辅助，不做像素级依据。
 
@@ -125,10 +140,14 @@ output_dir/
 └── gen/README.md
 ```
 
-## 构建
+## 构建与回归
 
 ```bash
 ./node_modules/.bin/tsc -p tsconfig.json     # 或 bash scripts/build.sh
+npm run selftest
+
+# 额外的 Roompedia 真实样例：由调用者提供已解码数据，输出基准页/PNG/图标证据
+node scripts/roompedia-regression.mjs /path/to/figma_<fileKey>_110-854.ws.json /path/to/output
 ```
 
 装进 DSH profile：把 `lib/` 与 `package.json` 同步到

@@ -11,7 +11,7 @@
  *     输出 `abs-vs-flex.json`。差异为 0 才说明"flex 计划能复现设计"，否则是计划本身错了，
  *     而不是实现写错了 —— 这条判据把"翻译阶段的损耗"变成了可断言的产物。
  */
-import type { DesignBorder, DesignModel, DesignNode } from './design.js'
+import type { DesignBorder, DesignGridTrack, DesignModel, DesignNode } from './design.js'
 
 export interface Box {
   x: number
@@ -45,18 +45,63 @@ const ALIGN: Record<string, string> = {
 }
 
 export const isHorizontal = (mode?: string): boolean => String(mode ?? '').toUpperCase() === 'HORIZONTAL'
+export const isGrid = (mode?: string): boolean => String(mode ?? '').toUpperCase() === 'GRID'
+
+interface Track extends DesignGridTrack { index: number }
+function gridTracks(n: DesignNode, axis: 'column' | 'row'): Track[] {
+  const g = n.layout?.grid
+  const raw = g ? (axis === 'column' ? g.columnSizing : g.rowSizing) : []
+  const count = g ? (axis === 'column' ? g.columnIds.length : g.rowIds.length) : 0
+  const tracks: Track[] = raw.map((t, index) => ({ ...t, index }))
+  while (tracks.length < count) tracks.push({ type: 'FLEX', value: 1, index: tracks.length })
+  if (!tracks.length && axis === 'row') tracks.push({ type: 'HUG', value: 1, index: 0 })
+  return tracks
+}
+function trackCss(t: Track): string {
+  const type = String(t.type ?? 'FLEX').toUpperCase()
+  if (type === 'FLEX') return `minmax(0, ${num(t.value || 1)}fr)`
+  if (type === 'HUG' || type === 'AUTO') return 'auto'
+  return `${num(t.value)}px`
+}
+/** CSS 与 verifyFlexPlan 共用同一套轨道归一；未知 sizing 会明确回退为 auto，而不是悄悄按垂直 flex。 */
+export function gridStyle(n: DesignNode): { columns: Track[]; rows: Track[]; decls: string[] } {
+  const g = n.layout?.grid
+  const columns = gridTracks(n, 'column')
+  const rows = gridTracks(n, 'row')
+  if (!g || !columns.length) return { columns, rows, decls: [] }
+  const decls = [
+    'display: grid', 'grid-auto-flow: row',
+    `grid-template-columns: ${columns.map(trackCss).join(' ')}`,
+    `grid-template-rows: ${rows.map(trackCss).join(' ')}`,
+    `column-gap: ${num(g.columnGap)}px`, `row-gap: ${num(g.rowGap)}px`,
+  ]
+  const [pt, pr, pb, pl] = contentInsets(n)
+  if (pt || pr || pb || pl) decls.push(`padding: ${num(pt)}px ${num(pr)}px ${num(pb)}px ${num(pl)}px`)
+  return { columns, rows, decls }
+}
 
 /**
- * flex 流里的**渲染顺序**：按设计坐标的主轴位置排，而不是按图层数组顺序。
- * 实测有些容器（如 132:9418）子项数组顺序与 x 顺序相反（z-order 与布局顺序不一致），
- * 按数组渲染会把两个子项左右调换 —— 与设计坐标不符。
+ * auto-layout 流里的**渲染顺序**。
+ *
+ * 优先用 parentIndex.position（Figma 明确的兄弟语义顺序），不能用坐标排序代替：
+ * WRAP 容器的第二行会被按 x 混到第一行中间（Roompedia 110:887 的 Tab 即因此错位）。
+ * 旧捕获没有 position 时才按坐标回退；Grid 必须先按行、再按列，而非只看 x。
  */
 export function orderFlow(kids: DesignNode[], parent: DesignNode): DesignNode[] {
+  const indexed = kids.map((c, i) => ({ c, i }))
+  if (indexed.every(({ c }) => typeof c.raw.parentIndex?.position === 'string')) {
+    return indexed.sort((a, b) => {
+      const ap = String(a.c.raw.parentIndex.position)
+      const bp = String(b.c.raw.parentIndex.position)
+      return (ap < bp ? -1 : ap > bp ? 1 : 0) || a.i - b.i
+    }).map(({ c }) => c)
+  }
   const row = isHorizontal(parent.layout?.mode)
-  return kids
-    .map((c, i) => ({ c, i }))
-    .sort((a, b) => (row ? a.c.x - b.c.x : a.c.y - b.c.y) || a.i - b.i)
-    .map((x) => x.c)
+  const grid = String(parent.layout?.mode).toUpperCase() === 'GRID'
+  return indexed.sort((a, b) => {
+    if (grid) return (a.c.y - b.c.y) || (a.c.x - b.c.x) || a.i - b.i
+    return (row ? a.c.x - b.c.x : a.c.y - b.c.y) || a.i - b.i
+  }).map(({ c }) => c)
 }
 
 /** 子项是否在父容器的 flex 流里（绝对子项 / 父容器不是 auto-layout 时不在） */
@@ -94,9 +139,11 @@ export function flexDecls(n: DesignNode): string[] {
   const l = n.layout
   if (!l?.mode) return []
   const row = isHorizontal(l.mode)
+  if (isGrid(l.mode)) return gridStyle(n).decls
   const d: string[] = ['display: flex', `flex-direction: ${row ? 'row' : 'column'}`]
   // CSS 的 gap 不接受负值；Figma 里负 spacing 表示"重叠"，用子项负 margin 表达（见 flowChildDecls）
   if (l.spacing && l.spacing > 0) d.push(`gap: ${num(l.spacing)}px`)
+  if (l.counterSpacing != null) d.push(`${row ? 'row-gap' : 'column-gap'}: ${num(l.counterSpacing)}px`)
   const [pt, pr, pb, pl] = contentInsets(n)
   if (pt || pr || pb || pl) d.push(`padding: ${num(pt)}px ${num(pr)}px ${num(pb)}px ${num(pl)}px`)
   d.push(`justify-content: ${JUSTIFY[String(l.primaryAlign ?? 'MIN').toUpperCase()] ?? 'flex-start'}`)
@@ -108,6 +155,7 @@ export function flexDecls(n: DesignNode): string[] {
 /** 子项在父 flex 流里的声明（不含尺寸/背景） */
 export function flowChildDecls(child: DesignNode, parent: DesignNode, index = 0): string[] {
   const d: string[] = ['position: relative']
+  if (isGrid(parent.layout?.mode)) return d
   const row = isHorizontal(parent.layout?.mode)
   const grow = Number(child.layout?.childGrow ?? 0)
   const basis = row ? child.w : child.h
@@ -134,6 +182,21 @@ function num(v: unknown): string {
   return Number.isFinite(n) ? String(Math.round(n * 100) / 100) : '0'
 }
 
+function justifyOffset(justify: string, leftover: number, hasGrow: boolean): number {
+  if (hasGrow) return 0
+  if (justify === 'CENTER') return leftover / 2
+  if (justify === 'MAX') return leftover
+  return 0
+}
+function justifyDistribute(line: DesignNode[], innerMain: number, allMain: number, gap: number, justify: string): number {
+  if (justify !== 'SPACE_BETWEEN' || line.length < 2 || line.some((c) => Number(c.layout?.childGrow ?? 0) > 0)) return 0
+  return (innerMain - allMain - gap * (line.length - 1)) / (line.length - 1)
+}
+function mainSizeForGrid(child: DesignNode, track: number | undefined): number {
+  void child
+  return Math.max(0, Number(track ?? 0))
+}
+
 /**
  * 按 flex 规则推演子项位置，与设计坐标比对。
  * 只检查"在流里"的子项；绝对子项按 left/top 天然一致，不参与。
@@ -151,48 +214,90 @@ export function verifyFlexPlan(model: DesignModel, tol = 1): {
     if (n.raw.visible === false) return
     if (n.layout?.mode && n.children.length) {
       containers += 1
+      const gridMode = isGrid(n.layout.mode)
       const row = isHorizontal(n.layout.mode)
       const [padT, padR, padB, padL] = contentInsets(n)
       const innerMain = row ? n.w - padL - padR : n.h - padT - padB
       const gap = Number(n.layout.spacing ?? 0)
       const flow = orderFlow(n.children.filter((c) => c.raw.visible !== false && flowsInParent(c, n)), n)
       flowChildren += flow.length
-      const growers = flow.filter((c) => Number(c.layout?.childGrow ?? 0) > 0)
-      const allMain = flow.reduce((s, c) => s + (row ? c.w : c.h), 0)
-      const free = Math.max(0, innerMain - allMain - gap * Math.max(0, flow.length - 1))
-      const growEach = growers.length ? free / growers.length : 0
-      const justify = String(n.layout.primaryAlign ?? 'MIN').toUpperCase()
-      const usedMain = allMain + gap * Math.max(0, flow.length - 1)
-      const leftover = Math.max(0, innerMain - usedMain)
-      let cursor = row ? padL : padT
-      if (!growers.length) {
-        if (justify === 'CENTER') cursor += leftover / 2
-        else if (justify === 'MAX') cursor += leftover
-        else if (justify === 'SPACE_BETWEEN' && flow.length > 1) cursor += 0 // gap 已近似
+      const plans: Array<{ child: DesignNode; actual: Box }> = []
+      if (gridMode) {
+        // Figma Grid 的语义是显式轨道，不是 VERTICAL。按轨道 sizing 推演，而不是拿 t.m02 回抄答案。
+        const { columns, rows } = gridStyle(n)
+        const g = n.layout.grid!
+        const resolveTracks = (tracks: Track[], available: number, main: boolean): { values: number[]; offsets: number[] } => {
+          const values = tracks.map((t) => {
+            const type = String(t.type).toUpperCase()
+            if (type !== 'FLEX' && type !== 'HUG' && type !== 'AUTO') return t.value
+            const inLine = main ? flow.filter((_, i) => i % Math.max(1, columns.length) === t.index) : flow.filter((_, i) => Math.floor(i / Math.max(1, columns.length)) === t.index)
+            return type === 'FLEX' ? 0 : Math.max(0, ...inLine.map((c) => main ? c.w : c.h))
+          })
+          const flexWeight = tracks.reduce((s, t) => s + (String(t.type).toUpperCase() === 'FLEX' ? t.value || 1 : 0), 0)
+          const left = available - values.reduce((s, v) => s + v, 0)
+          tracks.forEach((t, i) => { if (String(t.type).toUpperCase() === 'FLEX') values[i] = flexWeight ? left * (t.value || 1) / flexWeight : 0 })
+          const offsets: number[] = []
+          values.forEach((v, i) => { offsets[i] = (offsets[i - 1] ?? 0) + (i ? values[i - 1] + (main ? g.columnGap : g.rowGap) : 0) })
+          return { values, offsets }
+        }
+        const cPlan = resolveTracks(columns, n.w - padL - padR - g.columnGap * Math.max(0, columns.length - 1), true)
+        const rPlan = resolveTracks(rows, n.h - padT - padB - g.rowGap * Math.max(0, rows.length - 1), false)
+        flow.forEach((child, i) => {
+          const c = i % Math.max(1, columns.length)
+          const r = Math.floor(i / Math.max(1, columns.length))
+          plans.push({ child, actual: {
+            x: n.x + padL + (cPlan.offsets[c] ?? 0), y: n.y + padT + (rPlan.offsets[r] ?? 0),
+            w: mainSizeForGrid(child, cPlan.values[c]), h: mainSizeForGrid(child, rPlan.values[r]),
+          } })
+        })
+      } else {
+        // WRAP：先按真实容器宽度分行，再分别做主轴对齐；不能把所有子项当作一根永不换行的轴。
+        const wrap = String(n.layout.wrap ?? 'NO_WRAP').toUpperCase() === 'WRAP'
+        const lines: DesignNode[][] = [[]]
+        if (wrap) {
+          for (const c of flow) {
+            let line = lines[lines.length - 1]
+            const used = line.reduce((s, x) => s + (row ? x.w : x.h), 0) + gap * Math.max(0, line.length - 1)
+            if (line.length && used + gap + (row ? c.w : c.h) > innerMain + 0.01) { line = []; lines.push(line) }
+            line.push(c)
+          }
+        } else lines[0] = flow
+        let lineCross = row ? padT : padL
+        for (const line of lines) {
+          const growers = line.filter((c) => Number(c.layout?.childGrow ?? 0) > 0)
+          const allMain = line.reduce((s, c) => s + (row ? c.w : c.h), 0)
+          const growWeight = growers.reduce((s, c) => s + Number(c.layout?.childGrow ?? 0), 0)
+          const free = Math.max(0, innerMain - allMain - gap * Math.max(0, line.length - 1))
+          const justify = String(n.layout.primaryAlign ?? 'MIN').toUpperCase()
+          const distribute = justifyDistribute(line, innerMain, allMain, gap, justify)
+          let cursor = row ? padL : padT
+          cursor += justifyOffset(justify, innerMain - allMain - gap * Math.max(0, line.length - 1) - distribute * Math.max(0, line.length - 1), growers.length > 0)
+          const lineHeight = Math.max(0, ...line.map((c) => row ? c.h : c.w))
+          for (let i = 0; i < line.length; i++) {
+            const c = line[i]
+            const grow = Number(c.layout?.childGrow ?? 0) > 0 && growWeight ? free * Number(c.layout?.childGrow ?? 0) / growWeight : 0
+            const mainSize = (row ? c.w : c.h) + grow
+            const crossSize = row ? c.h : c.w
+            const crossAvail = row ? n.h - padT - padB : n.w - padL - padR
+            const self = String(c.layout?.childAlignSelf ?? '').toUpperCase()
+            const align = self && self !== 'AUTO' && self !== 'STRETCH' ? self : String(n.layout.counterAlign ?? 'MIN').toUpperCase()
+            const crossAvailable = wrap ? Math.max(crossSize, lineHeight) : crossAvail
+            const offset = align === 'CENTER' ? (crossAvailable - crossSize) / 2 : align === 'MAX' ? crossAvailable - crossSize : 0
+            const crossStart = wrap && row ? lineCross : wrap ? lineCross : row ? padT : padL
+            plans.push({ child: c, actual: row
+              ? { x: n.x + cursor, y: n.y + crossStart + offset, w: mainSize, h: crossSize }
+              : { x: n.x + crossStart + offset, y: n.y + cursor, w: crossSize, h: mainSize } })
+            cursor += mainSize + gap + distribute
+          }
+          lineCross += lineHeight + Number(n.layout.counterSpacing ?? 0)
+        }
       }
-      for (const c of flow) {
-        const base = row ? c.w : c.h
-        const mainSize = Number(c.layout?.childGrow ?? 0) > 0 ? base + growEach : base
-        const crossStart = row ? padT : padL
-        const crossAvail = row ? n.h - padT - padB : n.w - padL - padR
-        const crossSize = row ? c.h : c.w
-        const align = String(n.layout.counterAlign ?? 'MIN').toUpperCase()
-        const rawOffset = align === 'CENTER' ? (crossAvail - crossSize) / 2 : align === 'MAX' ? crossAvail - crossSize : 0
-        const crossOffset = Math.max(0, rawOffset)
-        const actual: Box = row
-          ? { x: n.x + cursor, y: n.y + crossStart + crossOffset, w: mainSize, h: crossSize }
-          : { x: n.x + crossStart + crossOffset, y: n.y + cursor, w: crossSize, h: mainSize }
+      for (const { child: c, actual } of plans) {
         const expected: Box = { x: c.x, y: c.y, w: c.w, h: c.h }
         const delta: [number, number, number, number] = [
-          Math.round(actual.x - expected.x),
-          Math.round(actual.y - expected.y),
-          Math.round(actual.w - expected.w),
-          Math.round(actual.h - expected.h),
-        ]
-        if (delta.some((v) => Math.abs(v) > tol)) {
-          mismatches.push({ id: c.id, name: c.name, containerId: n.id, expected, actual, delta })
-        }
-        cursor += mainSize + gap
+          actual.x - expected.x, actual.y - expected.y, actual.w - expected.w, actual.h - expected.h,
+        ].map((v) => Math.round(v * 100) / 100) as [number, number, number, number]
+        if (delta.some((v) => Math.abs(v) > tol)) mismatches.push({ id: c.id, name: c.name, containerId: n.id, expected, actual, delta })
       }
     }
     for (const c of n.children) walk(c)

@@ -78,6 +78,17 @@ export interface DesignLayout {
     counterSizing?: string;
     /** NO_WRAP | WRAP */
     wrap?: string;
+    /** WRAP 时两条主轴之间的距离（Kiwi stackCounterSpacing） */
+    counterSpacing?: number;
+    /** Kiwi Grid：轨道顺序 + sizing。不要把 GRID 当 VERTICAL 渲染。 */
+    grid?: {
+        columnIds: string[];
+        rowIds: string[];
+        columnSizing: DesignGridTrack[];
+        rowSizing: DesignGridTrack[];
+        columnGap: number;
+        rowGap: number;
+    };
     /** 自己在父 auto-layout 里的拉伸权重（0/1） */
     childGrow?: number;
     /** 自己在父容器交叉轴上的对齐：AUTO | STRETCH | ... */
@@ -86,6 +97,30 @@ export interface DesignLayout {
     absolute?: boolean;
     /** 边框是否占空间（影响 padding 计算） */
     bordersTakeSpace?: boolean;
+}
+export interface DesignGridTrack {
+    type: string;
+    value: number;
+}
+/** INSTANCE 的 derivedSymbolData 中保留下来的真实文本度量与字体。 */
+export interface InstanceTextPart {
+    path: string;
+    value: string;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    size: number;
+    family: string;
+    weight: number;
+    lineHeight?: string;
+    /** 该局部坐标来自 derived 容器，而非 n.rx/ry */
+    hasPosition: boolean;
+    /** 有父 derived 几何的嵌套文本（如计數徽标）；容器尺寸可单独用于渲染 */
+    containerWidth?: number;
+    containerHeight?: number;
+    /** 父 derived 图形自带描边几何（有边框证据，不是"看图像猜"） */
+    containerStroke?: boolean;
 }
 export interface DesignTokens {
     colors: Record<string, string>;
@@ -129,6 +164,8 @@ export interface DesignNode {
     layout?: DesignLayout;
     /** INSTANCE 内部结构在 ws.json 中缺失（无 children / 无填充描边）→ 必须用项目组件重建 */
     instanceInternalMissing?: boolean;
+    /** 实例内每段覆写文字及 derived 度量；普通 TEXT 不使用。 */
+    instanceTexts?: InstanceTextPart[];
     /** 每个视觉属性的来源：design / inferred / placeholder */
     prov?: Record<string, Prov>;
     children: DesignNode[];
@@ -154,6 +191,8 @@ export interface DesignSpecRow {
     /** INSIDE / OUTSIDE / CENTER */
     strokeAlign?: string;
     font?: string;
+    /** INSTANCE 的 derived 文本字体与局部几何（已恢复到 non-opaque 的那部分） */
+    instanceFonts?: string;
     text?: string;
     layout?: string;
     /** 完整的行内 auto-layout 描述（含 grow/align-self/wrap） */
@@ -239,6 +278,8 @@ export declare function fontKeyOf(n: Any): string;
 export declare function instanceIsOpaque(n: Any, childCount: number): boolean;
 /** 实例里真正显示的文字藏在覆写链里（普通 TEXT 节点的 textData 拿不到） */
 export declare function overrideTextOf(n: Any): string | undefined;
+/** 文本位置：优先用包围它的 derived 容器；根文本再把 auto-layout 的计算补在后面。 */
+export declare function instanceTextPartsOf(n: Any): InstanceTextPart[];
 /** 扁平化（不含隐藏节点） */
 export declare function flatten(model: DesignModel): DesignNode[];
 export declare function buildDesignModel(nodeJson: Any): DesignModel;

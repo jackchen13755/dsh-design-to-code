@@ -18,6 +18,7 @@ import { inferDesignSystem, specTable } from './render-static.js'
 import { borderPaint, flexDecls, flowChildDecls, flowsInParent, orderFlow, radiusDecl, rootCssDecls } from './layout.js'
 import { detectRepeats, detectSections, reuseHints, renderComponentPlan, type RepeatGroup } from './componentize.js'
 import type { AuditResult } from './audit.js'
+import { iconRefOf } from './icons.js'
 
 export interface CodegenOptions {
   componentName: string
@@ -186,7 +187,7 @@ function emitNode(n: DesignNode, parent: DesignNode | undefined, indent: string,
     if (tag === 'skip') return
     const designName = escAttr(`${n.name} ${px(n.w)}x${px(n.h)}`)
     const inst = ctx.uid()
-    ctx.instanceTodo.push(`- ${n.id} \`${n.name}\` ${px(n.w)}×${px(n.h)} @(${Math.round(n.x)},${Math.round(n.y)})${n.value ? ` 文案「${n.value}」` : ''}`)
+    ctx.instanceTodo.push(`- ${n.id} \`${n.name}\` ${px(n.w)}×${px(n.h)} @(${Math.round(n.x)},${Math.round(n.y)})${n.value ? ` 文案「${n.value}」` : ''}${n.instanceTexts?.length ? `；derived 字体 ${n.instanceTexts.map((p) => `${p.value}=${p.family}/${p.weight}/${p.size}px`).join('、')}` : ''}${iconRefOf(n) ? `；图标库 ${iconRefOf(n)!.name}（用库中的 SVG，勿自绘）` : ''}`)
     if (tag === 'input' || tag === 'select' || tag === 'date') {
       const rad = radiusDecl(n, ctx.ds.radius)
       if (!n.background) d.push('background: #fff')
@@ -222,14 +223,18 @@ function emitNode(n: DesignNode, parent: DesignNode | undefined, indent: string,
     }
     d.push(`border-radius: ${radiusDecl(n, ctx.ds.radius).value}`)
     const c = ctx.cls(d.join(';\n  '))
-    ctx.jsx.push(`${indent}<span className={styles.${c}} data-design-id="${escAttr(n.id)}" data-design-name="${designName}">${jsxText(n.value ?? n.name)}</span>`)
+    const iconRef = iconRefOf(n)
+    ctx.jsx.push(`${indent}<span className={styles.${c}} data-design-id="${escAttr(n.id)}" data-design-name="${designName}"${iconRef ? ` data-icon-library="${escAttr(iconRef.name)}"` : ''}>${jsxText(n.value ?? (iconRef ? '' : n.name))}</span>`)
     return
   }
 
   if (n.kind === 'icon') {
+    const iconRef = iconRefOf(n)
+    if (iconRef) ctx.instanceTodo.push(`- ${n.id} \`${n.name}\`：图标库 ${iconRef.name}；用项目图标组件/库中原 SVG，不要自绘路径`)
+    else ctx.instanceTodo.push(`- ${n.id} \`${n.name}\`：没有图标库标识，先在项目图标库中确认映射，不要按名字猜或按路径临摹`)
     d.push('border-style: dashed', `border-color: ${ctx.ds.lineStrong}`, 'border-width: 1px', 'border-radius: 2px')
     const c = ctx.cls(d.join(';\n  '))
-    ctx.jsx.push(`${indent}{/* 图标占位：设计数据里没有矢量路径，请用项目图标组件替换 */}\n${indent}<div className={styles.${c}} data-design-id="${escAttr(n.id)}" aria-hidden="true" />`)
+    ctx.jsx.push(`${indent}{/* 图标占位：使用项目图标库的 SVG，不要从 Figma 路径自绘 */}\n${indent}<div className={styles.${c}} data-design-id="${escAttr(n.id)}"${iconRef ? ` data-icon-library="${escAttr(iconRef.name)}"` : ''} aria-hidden="true" />`)
     return
   }
 
@@ -474,7 +479,7 @@ ${styles.join('\n')}
   }
   P.push('', '## 逐节点规格表（id | name | type | x | y | w | h | 背景 | 描边(四边) | 虚线 | 圆角 | 字体 | 文案 | layout）', '', '```', specTable(model, 500), '```', '')
   if (instanceTodo.length) {
-    P.push('', '## 需要你用项目组件替换的实例占位（设计数据里没有实例内部结构）', '', ...instanceTodo.slice(0, 120))
+    P.push('', '## 实例与图标清单（恢复 derived 数据后仍要用项目组件/图标库替换）', '', ...instanceTodo.slice(0, 120))
   }
   P.push(
     '',
@@ -482,13 +487,15 @@ ${styles.join('\n')}
     '1. **先看基准页**：`index.html`/`SPEC.md` 是视觉与规格基准，逐条对齐；',
     '2. **占位换组件**：把 `data-design-name` 标记的占位换成项目既有组件（Input/Select/DatePicker/Button…），',
     '   不要自己重画控件；设计给的尺寸/逐角圆角/文案要保留；',
-    '3. **保持 flex 结构**：骨架已按设计稿 auto-layout 输出 `display:flex` 与 gap/padding/justify/align/grow，',
-    '   不要改回绝对定位；只有 `stackPositioning=ABSOLUTE` 的子项才是绝对定位；',
+    '3. **保持 auto-layout 结构**：骨架已按设计稿输出 `display:flex` 或 Grid 的 `display:grid`，含两轴 gap/padding/justify/align/grow；',
+    '   不要改回绝对定位，也不要把 Grid 改成 flex；只有 `stackPositioning=ABSOLUTE` 的子项才是绝对定位；',
     '4. **色值走主题令牌**：`tokens.ts` 里是设计稿 literal 值，落项目时映射到项目主题变量；',
     '   映射不上的列出来找设计确认（不要静默换成别的颜色）；',
     '5. **逐边描边/逐角圆角/虚线**：`border-width` 分边写；dashPattern 用 `repeating-linear-gradient` 或 SVG stroke（CSS dashed 段长不可控）；',
-    '6. 交互：受控表单、校验、按钮动作、关闭（Esc/遮罩）、可访问性；输出 `src/${name}.tsx`、`src/types.ts`、逻辑 hooks、必要测试；',
-    '7. 类型安全、不引入第三方运行时依赖。',
+    '6. **图标必须使用项目/图标库的 SVG**：带 `data-icon-library` 的节点按标识精确匹配；没有标识的先确认映射。',
+    '   不许按 Figma 路径自绘，也不许凭图层名猜一个相似图标；',
+    '7. 交互：受控表单、校验、按钮动作、关闭（Esc/遮罩）、可访问性；输出 `src/${name}.tsx`、`src/types.ts`、逻辑 hooks、必要测试；',
+    '8. 类型安全、不引入第三方运行时依赖。',
     '',
     '## 已知占位（不是实现缺陷，不要"修"它）',
     '- 带 `data-src="placeholder"` / `data-guessed` 的元素是设计数据缺失处（实例内部、矢量图标、位图）；',

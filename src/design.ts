@@ -82,6 +82,17 @@ export interface DesignLayout {
   counterSizing?: string
   /** NO_WRAP | WRAP */
   wrap?: string
+  /** WRAP 时两条主轴之间的距离（Kiwi stackCounterSpacing） */
+  counterSpacing?: number
+  /** Kiwi Grid：轨道顺序 + sizing。不要把 GRID 当 VERTICAL 渲染。 */
+  grid?: {
+    columnIds: string[]
+    rowIds: string[]
+    columnSizing: DesignGridTrack[]
+    rowSizing: DesignGridTrack[]
+    columnGap: number
+    rowGap: number
+  }
   /** 自己在父 auto-layout 里的拉伸权重（0/1） */
   childGrow?: number
   /** 自己在父容器交叉轴上的对齐：AUTO | STRETCH | ... */
@@ -90,6 +101,32 @@ export interface DesignLayout {
   absolute?: boolean
   /** 边框是否占空间（影响 padding 计算） */
   bordersTakeSpace?: boolean
+}
+
+export interface DesignGridTrack {
+  type: string
+  value: number
+}
+
+/** INSTANCE 的 derivedSymbolData 中保留下来的真实文本度量与字体。 */
+export interface InstanceTextPart {
+  path: string
+  value: string
+  x: number
+  y: number
+  w: number
+  h: number
+  size: number
+  family: string
+  weight: number
+  lineHeight?: string
+  /** 该局部坐标来自 derived 容器，而非 n.rx/ry */
+  hasPosition: boolean
+  /** 有父 derived 几何的嵌套文本（如计數徽标）；容器尺寸可单独用于渲染 */
+  containerWidth?: number
+  containerHeight?: number
+  /** 父 derived 图形自带描边几何（有边框证据，不是"看图像猜"） */
+  containerStroke?: boolean
 }
 
 export interface DesignTokens {
@@ -130,6 +167,8 @@ export interface DesignNode {
   layout?: DesignLayout
   /** INSTANCE 内部结构在 ws.json 中缺失（无 children / 无填充描边）→ 必须用项目组件重建 */
   instanceInternalMissing?: boolean
+  /** 实例内每段覆写文字及 derived 度量；普通 TEXT 不使用。 */
+  instanceTexts?: InstanceTextPart[]
   /** 每个视觉属性的来源：design / inferred / placeholder */
   prov?: Record<string, Prov>
   children: DesignNode[]
@@ -156,6 +195,8 @@ export interface DesignSpecRow {
   /** INSIDE / OUTSIDE / CENTER */
   strokeAlign?: string
   font?: string
+  /** INSTANCE 的 derived 文本字体与局部几何（已恢复到 non-opaque 的那部分） */
+  instanceFonts?: string
   text?: string
   layout?: string
   /** 完整的行内 auto-layout 描述（含 grow/align-self/wrap） */
@@ -406,6 +447,107 @@ export function overrideTextOf(n: Any): string | undefined {
   return undefined
 }
 
+const guidPathOf = (d: Any): string => (d?.guidPath?.guids ?? [])
+  .map((g: Any) => `${Number(g.sessionID)}:${Number(g.localID)}`).join('/')
+const point = (v: unknown): number => Number.isFinite(Number(v)) ? Number(v) : 0
+
+/** 文本位置：优先用包围它的 derived 容器；根文本再把 auto-layout 的计算补在后面。 */
+export function instanceTextPartsOf(n: Any): InstanceTextPart[] {
+  const derived = Array.isArray(n?.derivedSymbolData) ? n.derivedSymbolData : []
+  const byPath = new Map<string, Any>(derived.map((d: Any) => [guidPathOf(d), d]))
+  const overrides = Array.isArray(n?.symbolData?.symbolOverrides) ? n.symbolData.symbolOverrides : []
+  const parts: InstanceTextPart[] = []
+  let plainOffset = 0
+  for (const o of overrides) {
+    const value = o?.textData?.characters
+    if (!value || !o?.guidPath) continue
+    const path = guidPathOf(o)
+    const d = byPath.get(path) ?? {}
+    const text = d.derivedTextData ?? {}
+    const glyphSize = Number(text.glyphs?.[0]?.fontSize ?? 0)
+    const meta = text.fontMetaData?.[0] ?? {}
+    const font = meta.key ?? {}
+    const lhs = text.baselines?.[0]?.lineHeight
+    let x = point(d.transform?.m02)
+    let y = point(d.transform?.m12)
+    let hasPosition = !!d.transform
+    let containerWidth: number | undefined
+    let containerHeight: number | undefined
+    let containerStroke = false
+    if (!hasPosition && o.guidPath.guids?.length > 1) {
+      // 嵌套文本（例如 Tab 的数量徽标）自身 transform 经常缺省，位置在父 derived 节点上。
+      const parentPath = o.guidPath.guids.slice(0, -1)
+        .map((g: Any) => `${Number(g.sessionID)}:${Number(g.localID)}`).join('/')
+      const parent = byPath.get(parentPath) ?? {}
+      if (parent.transform) {
+        const ts = text.layoutSize ?? {}
+        const ps = parent.size ?? {}
+        containerWidth = point(ps.x) || (point(ts.x) ? point(ts.x) + 8 : 0)
+        containerHeight = point(ps.y) || (point(ts.y) ? Math.max(14, point(ts.y) - 4) : 0)
+        // derived 里有 strokeGeometry 说明这个徽标是描边形状；没有它时不要凭空加边框。
+        containerStroke = Array.isArray(parent.strokeGeometry) && parent.strokeGeometry.length > 0
+        x = point(parent.transform.m02) + Math.max(0, (containerWidth - point(ts.x)) / 2)
+        y = point(parent.transform.m12) + Math.max(0, (containerHeight - point(ts.y)) / 2)
+        hasPosition = true
+      }
+    }
+    if (!hasPosition) {
+      // 只有根文本时没有坐标：按实例的 auto-layout 计算主轴起点/交叉轴距中。
+      // 第二个根文本紧接前一个；徽标等 nested derived 不计入普通文本流。
+      const layout = n
+      const horizontal = String(layout.stackMode ?? '').toUpperCase() === 'HORIZONTAL'
+      const tl = text.layoutSize ?? d.size ?? {}
+      const rootTexts = overrides.filter((it: Any) => it?.textData?.characters && it.guidPath?.guids?.length === 1)
+      const contentW = rootTexts.reduce((sum: number, _it: Any, i: number) => {
+        const dd = byPath.get(guidPathOf(rootTexts[i])) ?? {}
+        return sum + point(dd.derivedTextData?.layoutSize?.x ?? dd.size?.x)
+      }, 0)
+      const total = contentW + point(layout.stackSpacing) * Math.max(0, rootTexts.length - 1)
+      const centered = String(layout.stackPrimaryAlignItems ?? '').toUpperCase() === 'CENTER'
+      const xStart = point(layout.stackHorizontalPadding) + (centered ? Math.max(0, (point(n.size?.x) - point(layout.stackHorizontalPadding) * 2 - total) / 2) : 0)
+      const crossPad = point(layout.stackVerticalPadding)
+      const crossCenter = String(layout.stackCounterAlignItems ?? '').toUpperCase() === 'CENTER'
+      // 有 derived 徽标/图形时，根文本的起点由相邻图形的真实 x 反推；仅用 PRIMARY=CENTER
+      // 会把 "All 999" 的文字从 x=12 错放到 x=29（漏算徽标宽度）。
+      const anchors = derived.filter((it: Any) => it?.transform && it.guidPath?.guids?.length === 1)
+      const firstAnchor = anchors.sort((a: Any, b: Any) => point(a.transform.m02) - point(b.transform.m02))[0]
+      y = crossPad + (crossCenter ? Math.max(0, (point(n.size?.y) - crossPad * 2 - point(tl.y)) / 2) : 0)
+      if (horizontal && plainOffset === 0 && firstAnchor && point(firstAnchor.transform.m02) >= point(tl.x)) {
+        x = point(firstAnchor.transform.m02) - point(layout.stackSpacing) - point(tl.x)
+      } else if (horizontal) {
+        x = xStart + plainOffset
+        y = crossPad + (crossCenter ? Math.max(0, (point(n.size?.y) - crossPad * 2 - point(tl.y)) / 2) : 0)
+        plainOffset += point(tl.x) + point(layout.stackSpacing)
+      } else {
+        x = crossPad + (crossCenter ? Math.max(0, (point(n.size?.x) - crossPad * 2 - point(tl.x)) / 2) : 0)
+        y = xStart + plainOffset
+        plainOffset += point(tl.y) + point(layout.stackSpacing)
+      }
+    }
+    const size = glyphSize || point(n.fontSize) || 14
+    const lh = Number(lhs)
+    parts.push({
+      path, value: String(value), x, y,
+      w: point(text.layoutSize?.x ?? d.size?.x),
+      h: point(text.layoutSize?.y ?? d.size?.y),
+      size, family: String(font.family ?? ''), weight: Number(meta.fontWeight) || 400,
+      lineHeight: lh > 0 ? `${Math.round(lh * 100) / 100}px` : undefined,
+      hasPosition, containerWidth, containerHeight, containerStroke,
+    })
+  }
+  return parts
+}
+
+function gridIds(entries: Any): string[] {
+  return (entries?.entries ?? []).map((e: Any) => `${Number(e?.id?.sessionID)}:${Number(e?.id?.localID)}`)
+}
+function gridSizing(entries: Any): DesignGridTrack[] {
+  return (entries?.entries ?? []).map((e: Any) => {
+    const t = e?.trackSize?.maxSizing ?? e?.trackSize?.minSizing ?? {}
+    return { type: String(t.type ?? 'FLEX'), value: Number(t.value ?? 1) }
+  })
+}
+
 function layoutOf(n: Any): DesignLayout | undefined {
   const l: DesignLayout = {}
   if (n.stackMode) l.mode = String(n.stackMode)
@@ -423,6 +565,17 @@ function layoutOf(n: Any): DesignLayout | undefined {
   if (n.stackPrimarySizing) l.primarySizing = String(n.stackPrimarySizing)
   if (n.stackCounterSizing) l.counterSizing = String(n.stackCounterSizing)
   if (n.stackWrap) l.wrap = String(n.stackWrap)
+  if (typeof n.stackCounterSpacing === 'number') l.counterSpacing = n.stackCounterSpacing
+  if (String(n.stackMode) === 'GRID') {
+    l.grid = {
+      columnIds: gridIds(n.gridColumns),
+      rowIds: gridIds(n.gridRows),
+      columnSizing: gridSizing(n.gridColumnsSizing),
+      rowSizing: gridSizing(n.gridRowsSizing),
+      columnGap: Number(n.gridColumnGap ?? n.stackSpacing ?? 0),
+      rowGap: Number(n.gridRowGap ?? n.stackSpacing ?? 0),
+    }
+  }
   if (typeof n.stackChildPrimaryGrow === 'number') l.childGrow = n.stackChildPrimaryGrow
   if (n.stackChildAlignSelf) l.childAlignSelf = String(n.stackChildAlignSelf)
   if (String(n.stackPositioning ?? '') === 'ABSOLUTE') l.absolute = true
@@ -528,8 +681,13 @@ function buildTree(
     }
     prov.text = 'design'
   } else if (String(root.type) === 'INSTANCE') {
-    // 坑 5：实例的可见文案只在覆写链里
+    // 实例覆写链里可能有多段文字（如 "Call" + 徽标 "1"），不能只保留第一段。
     node.value = overrideTextOf(root)
+    node.instanceTexts = instanceTextPartsOf(root)
+    if (node.instanceTexts.length) prov.text = 'design'
+    if (node.instanceTexts.length > 1) {
+      node.value = node.instanceTexts.map((part) => part.value).join(' ')
+    }
     if (instanceIsOpaque(root, kids.length)) {
       node.instanceInternalMissing = true
       prov.instance = 'placeholder'
@@ -628,6 +786,8 @@ export function buildDesignModel(nodeJson: Any): DesignModel {
     if (n.layout?.primarySizing) layoutParts.push(`primary=${n.layout.primarySizing}`)
     if (n.layout?.counterSizing) layoutParts.push(`counter=${n.layout.counterSizing}`)
     if (n.layout?.wrap && n.layout.wrap !== 'NO_WRAP') layoutParts.push(`wrap=${n.layout.wrap}`)
+    if (n.layout?.counterSpacing != null) layoutParts.push(`crossGap=${n.layout.counterSpacing}`)
+    if (n.layout?.grid) layoutParts.push(`grid=${n.layout.grid.columnIds.length}列×${n.layout.grid.rowIds.length || 1}行 gap=${n.layout.grid.columnGap}/${n.layout.grid.rowGap}`)
     if (n.layout?.childGrow) layoutParts.push(`grow=${n.layout.childGrow}`)
     if (n.layout?.childAlignSelf) layoutParts.push(`self=${n.layout.childAlignSelf}`)
     if (n.layout?.absolute) layoutParts.push('position=ABSOLUTE')
@@ -650,7 +810,8 @@ export function buildDesignModel(nodeJson: Any): DesignModel {
       radius: n.radius,
       dash: n.border?.dash?.join(','),
       strokeAlign: n.border?.align,
-      font: n.text ? `${n.text.family} ${n.text.weight} ${n.text.size}px/${n.text.lineHeight ?? '-'}` : undefined,
+      font: n.text ? `${n.text.family} ${n.text.weight} ${n.text.size}px/${n.text.lineHeight ?? '-'}` : n.instanceTexts?.map((p) => `${p.value}: ${p.family} ${p.weight} ${p.size}px/${p.lineHeight ?? '-'}`).join('；'),
+      instanceFonts: n.instanceTexts?.map((p) => `${p.value}: ${p.family} ${p.weight} ${p.size}px/${p.lineHeight ?? '-'} @(${p.x},${p.y}) ${p.w}×${p.h}`).join('；'),
       text: n.kind === 'text' ? n.value : n.value ? `（实例文案）${n.value}` : undefined,
       layout: layoutParts.length ? layoutParts.join(' ') : undefined,
       layoutFull: n.layout ? JSON.stringify(n.layout) : undefined,

@@ -5,6 +5,8 @@ export interface StaticRenderOptions {
     title?: string;
     /** 项目 token 映射（写进 SPEC.md 的对照表右列由调用方补） */
     projectName?: string;
+    /** nodeId → 图标库原始 SVG 的相对路径（不自绘路径） */
+    iconAssets?: Record<string, string>;
     /** 是否输出 SPEC.md（默认 true） */
     spec?: boolean;
 }
@@ -31,6 +33,7 @@ interface Ds {
     text: string;
     placeholder: string;
     primary: string;
+    accentSurface: string;
     radius: number;
     controlH: number;
     fontFamily: string;
@@ -48,7 +51,7 @@ export declare function joinRoleOf(n: DesignNode): JoinRole | undefined;
 /** 从设计数据里"投票"出设计系统常量，避免把某个项目的色值写死在插件里 */
 export declare function inferDesignSystem(model: DesignModel): Ds;
 /** 生成 SPEC.md：设计规格 + 到项目 token 的映射表（右列由人/会话填） */
-export declare function renderSpecMarkdown(model: DesignModel, ds: Ds, projectName?: string): string;
+export declare function renderSpecMarkdown(model: DesignModel, ds: Ds, projectName?: string, iconAssets?: Record<string, string>): string;
 export declare function renderStatic(model: DesignModel, opts: StaticRenderOptions): StaticRenderResult;
 /** 供 codegen 复用的摘要行（把规格表塞进 Codegen Prompt） */
 export declare function specTable(model: DesignModel, limit?: number): string;

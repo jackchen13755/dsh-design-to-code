@@ -11,7 +11,7 @@
  *     输出 `abs-vs-flex.json`。差异为 0 才说明"flex 计划能复现设计"，否则是计划本身错了，
  *     而不是实现写错了 —— 这条判据把"翻译阶段的损耗"变成了可断言的产物。
  */
-import type { DesignBorder, DesignModel, DesignNode } from './design.js';
+import type { DesignBorder, DesignGridTrack, DesignModel, DesignNode } from './design.js';
 export interface Box {
     x: number;
     y: number;
@@ -27,10 +27,22 @@ export interface FlexMismatch {
     delta: [number, number, number, number];
 }
 export declare const isHorizontal: (mode?: string) => boolean;
+export declare const isGrid: (mode?: string) => boolean;
+interface Track extends DesignGridTrack {
+    index: number;
+}
+/** CSS 与 verifyFlexPlan 共用同一套轨道归一；未知 sizing 会明确回退为 auto，而不是悄悄按垂直 flex。 */
+export declare function gridStyle(n: DesignNode): {
+    columns: Track[];
+    rows: Track[];
+    decls: string[];
+};
 /**
- * flex 流里的**渲染顺序**：按设计坐标的主轴位置排，而不是按图层数组顺序。
- * 实测有些容器（如 132:9418）子项数组顺序与 x 顺序相反（z-order 与布局顺序不一致），
- * 按数组渲染会把两个子项左右调换 —— 与设计坐标不符。
+ * auto-layout 流里的**渲染顺序**。
+ *
+ * 优先用 parentIndex.position（Figma 明确的兄弟语义顺序），不能用坐标排序代替：
+ * WRAP 容器的第二行会被按 x 混到第一行中间（Roompedia 110:887 的 Tab 即因此错位）。
+ * 旧捕获没有 position 时才按坐标回退；Grid 必须先按行、再按列，而非只看 x。
  */
 export declare function orderFlow(kids: DesignNode[], parent: DesignNode): DesignNode[];
 /** 子项是否在父容器的 flex 流里（绝对子项 / 父容器不是 auto-layout 时不在） */
@@ -84,3 +96,4 @@ export declare function radiusDecl(n: DesignNode, dsRadius: number): {
 };
 /** 根节点（#frame / .root）的声明：根自己也可能有 auto-layout，必须有 display:flex */
 export declare function rootCssDecls(model: DesignModel): string[];
+export {};
