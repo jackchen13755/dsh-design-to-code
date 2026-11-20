@@ -86,6 +86,12 @@ const px = (v: unknown): string => {
   return Number.isFinite(n) ? String(Math.round(n * 100) / 100) : '0'
 }
 
+/** 设计备注/标题新契约字段的摘要；字段未落地或 undefined 时兜底，不臆造 */
+const fmtConf = (v: number | undefined): string =>
+  typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '-'
+const fmtSignals = (s: Array<{ kind: string; weight: number; value?: string }> | undefined): string =>
+  (s ?? []).map((x) => `${x.kind}:${x.weight}${x.value ? `(${x.value})` : ''}`).join('、') || '-'
+
 interface InstKindRule { re: RegExp; tag: string }
 const INSTANCE_RULES: InstKindRule[] = [
   { re: /hand|cursor|光标/i, tag: 'skip' },
@@ -477,6 +483,42 @@ ${styles.join('\n')}
   if (opts.auditMd) {
     P.push('', '## 设计审计核对清单（逐项勾选；"真歧义"才需要问人，"数据缺失"按兜底规则做）', '', '```markdown', opts.auditMd.trim(), '```', '')
   }
+  if (model.annotations.length) {
+    P.push('', '## 设计备注 = 交互说明（必须按原文实现，不是视觉元素）', '')
+    P.push('画布红字备注已从基准页移除；下面每一条都是**行为要求**。必须按下表逐条落实，单元格留空即未完成：', '')
+    P.push('| 备注 | 承载 props/state | 事件 | 文件 | 验证 |')
+    P.push('|---|---|---|---|---|')
+    for (const [i, a] of model.annotations.entries()) {
+      const disp = a.disposition === 'candidate' ? '候选·待确认' : '自动'
+      const cell = `备注${i + 1}「${a.title}」：${a.text.replace(/\n+/g, ' / ')}（置信度 ${fmtConf(a.confidence)} · ${disp} · 信号 ${fmtSignals(a.signals)}）`
+      P.push(`| ${cell.replace(/\|/g, '\\|')} |  |  |  |  |`)
+    }
+    P.push('')
+    P.push('把原文语义翻译成具体代码的示例（照着做，不是抄成注释）：')
+    P.push('- 「自动激活其他日期」→ 激活态 state（如 activeDate）+ 各日期单元格的 onClick，点选后同步高亮；')
+    P.push('- 「仅点击后才可编辑」→ editable 布尔 state + 点击守卫：未进入编辑态渲染只读，点击后才切换为 input；')
+    P.push('- 「日期范围显示在组件里」→ 把范围值作为 props 传入并绑定到展示节点，不在组件内硬编码。')
+    P.push('处置为「候选·待确认」的备注先标记待确认、不得静默丢弃，确认后再补齐上表；scope=unassigned 或无适用组件的先找人确认作用范围。')
+    P.push('')
+  }
+  if (model.titles?.length) {
+    P.push('', '## 设计标题（用于组件命名 + 可访问性标题）', '')
+    P.push('下列标题来自设计数据（text/source/level/证据节点），文本是真实 UI、基准页已正常渲染。逐条对照：')
+    P.push('1. 作为组件/分区命名依据（source=prominentText 优先，其次 frameName / annotationTitle）；')
+    P.push('2. 作为可访问性标题：level=page 用 `<h1>`/页面标题，level=section 用 `<h2>`/分区标题，并写进 aria-label；')
+    P.push('3. 按证据节点核对文案、字号与位置，不要臆造或改写标题文本。', '')
+    P.push('| # | 标题文本 | 来源 | 级别 | 证据节点 | 置信度 | 信号 |')
+    P.push('|---|---|---|---|---|---|---|')
+    model.titles.forEach((t, i) => {
+      const ev = [
+        t.nodeId ? `节点 ${t.nodeId}` : '',
+        t.x != null && t.y != null && t.w != null && t.h != null ? `@(${t.x},${t.y}) ${t.w}×${t.h}` : '',
+        t.fontSize != null ? `${t.fontSize}px` : '',
+      ].filter(Boolean).join(' ') || '-'
+      P.push(`| ${i + 1} | ${String(t.text).replace(/\|/g, '\\|')} | ${escText(t.source)} | ${escText(t.level)} | ${ev} | ${fmtConf(t.confidence)} | ${fmtSignals(t.signals).replace(/\|/g, '\\|')} |`)
+    })
+    P.push('')
+  }
   P.push('', '## 逐节点规格表（id | name | type | x | y | w | h | 背景 | 描边(四边) | 虚线 | 圆角 | 字体 | 文案 | layout）', '', '```', specTable(model, 500), '```', '')
   if (instanceTodo.length) {
     P.push('', '## 实例与图标清单（恢复 derived 数据后仍要用项目组件/图标库替换）', '', ...instanceTodo.slice(0, 120))
@@ -495,7 +537,10 @@ ${styles.join('\n')}
     '6. **图标必须使用项目/图标库的 SVG**：带 `data-icon-library` 的节点按标识精确匹配；没有标识的先确认映射。',
     '   不许按 Figma 路径自绘，也不许凭图层名猜一个相似图标；',
     '7. 交互：受控表单、校验、按钮动作、关闭（Esc/遮罩）、可访问性；输出 `src/${name}.tsx`、`src/types.ts`、逻辑 hooks、必要测试；',
-    '8. 类型安全、不引入第三方运行时依赖。',
+    '8. 类型安全、不引入第三方运行时依赖；',
+    '9. **设计备注逐条落实**：`## 设计备注 = 交互说明` 的强制映射表每行都要填满「承载 props/state | 事件 | 文件 | 验证」，空着即未完成；候选备注先标待确认、不得静默丢弃；',
+    '   交付说明逐条回答承载字段、实现文件、验证方式。只抄成注释或静默忽略都算未完成。',
+    '10. **设计标题逐条对照**：`## 设计标题` 每条用于组件/分区命名与可访问性标题（page→h1、section→h2），按证据节点核对文案与字号，不臆造、不改写、不遗漏。',
     '',
     '## 已知占位（不是实现缺陷，不要"修"它）',
     '- 带 `data-src="placeholder"` / `data-guessed` 的元素是设计数据缺失处（实例内部、矢量图标、位图）；',
@@ -512,7 +557,8 @@ ${styles.join('\n')}
     '   然后 `figma_review_to_round(output_dir, review=<专家原文>, reviewer="UI 视觉验收设计师")`；',
     '5. 专家会产出**标注图**（问题按 id 钉在基准图上）与**打回清单**；判定为 reject 时：',
     '   逐条修复 → `action="close"` 关闭 → **再提审一轮拿 pass**（开发自述"改完了"不算通过）；',
-    '6. 把查到的项目既有模式沉淀成可复用事实。',
+    '6. 把查到的项目既有模式沉淀成可复用事实；',
+    '7. 设计备注 + 设计标题逐条对照：备注按强制映射表填满「承载字段/事件/文件/验证」，候选（待确认）先标记再落实、不得静默丢弃；标题逐条核对命名与可访问性标题（page→h1、section→h2）及证据节点；确实无法实现的要显式说明原因，不能静默跳过。',
   )
   writeFileSync(join(outDir, 'CODEGEN_PROMPT.md'), P.join('\n'), 'utf8')
 

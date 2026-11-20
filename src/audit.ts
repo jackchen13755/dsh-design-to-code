@@ -41,11 +41,49 @@ function flat(model: DesignModel): DesignNode[] {
   return out
 }
 
+/** 设计契约（DesignAnnotation/DesignTitle）里的置信度/信号摘要；字段未落地或值为 undefined 时兜底，不臆造 */
+const fmtConf = (v: number | undefined): string =>
+  typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '-'
+const fmtSignals = (s: Array<{ kind: string; weight: number; value?: string }> | undefined): string =>
+  (s ?? []).map((x) => `${x.kind}:${x.weight}${x.value ? `(${x.value})` : ''}`).join('、') || '-'
+
 export function auditModel(model: DesignModel): AuditResult {
   const nodes = flat(model)
   const checklist = new Set<string>()
   const ambiguous: string[] = []
   const missing = new Set<string>()
+
+  // ── 设计备注 = 交互说明：必须逐条实现，不是"看一眼" ──
+  // 候选（disposition='candidate'）进 ambiguous 标"待确认"、不静默丢弃；
+  // 未归属（scope='unassigned' 或无 targetName）进 missing。多语言原文透传。
+  if (model.annotations.length) {
+    for (const [i, a] of model.annotations.entries()) {
+      const target = a.targetName ? ` → ${a.targetName}（${a.targetId ?? '-'}）` : ' → 未归属（需确认适用组件）'
+      const disp = a.disposition === 'candidate' ? '候选·待确认' : '自动'
+      const conf = fmtConf(a.confidence)
+      const sig = fmtSignals(a.signals)
+      checklist.add(`【设计备注 ${i + 1}】${a.title}${target}：${a.text.replace(/\n+/g, ' / ')} · 处置=${disp} · 置信度=${conf} · 信号=${sig}`)
+      if (a.disposition === 'candidate') {
+        ambiguous.push(`【设计备注候选·待确认】${a.id} ${a.title}：disposition=candidate（置信度=${conf}，信号=${sig}），需人工确认后再落实，不得静默丢弃`)
+      }
+      if (a.scope === 'unassigned' || !a.targetName) {
+        missing.add(`【备注未归属】${a.id} ${a.title}：scope=${a.scope ?? '-'}、无 targetName，没有可对应的组件/变体，需人工确认作用范围`)
+      }
+    }
+  }
+
+  // ── 设计标题：页面/分区命名与可访问性依据，逐条带 text/source/证据/置信度/信号 ──
+  if (model.titles?.length) {
+    for (const [i, t] of model.titles.entries()) {
+      const ev = [
+        t.nodeId ? `节点 ${t.nodeId}` : '',
+        t.x != null && t.y != null && t.w != null && t.h != null ? `@(${t.x},${t.y}) ${t.w}×${t.h}` : '',
+        t.fontSize != null ? `${t.fontSize}px` : '',
+        t.weight != null ? `weight=${t.weight}` : '',
+      ].filter(Boolean).join(' · ') || '无证据节点'
+      checklist.add(`【设计标题 ${i + 1}】"${t.text}"（source=${t.source} · level=${t.level}）· 证据=${ev} · 置信度=${fmtConf(t.confidence)} · 信号=${fmtSignals(t.signals)}`)
+    }
+  }
 
   // ── 骨架 ──
   checklist.add(`【骨架】画布 ${model.width}×${model.height}（节点 ${nodes.length}）`)

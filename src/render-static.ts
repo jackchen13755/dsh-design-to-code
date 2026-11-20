@@ -75,6 +75,12 @@ const px = (v: unknown): string => {
   return String(Math.round(n * 100) / 100)
 }
 
+/** 设计备注/标题新契约字段的摘要；字段未落地或 undefined 时兜底，不臆造 */
+const fmtConf = (v: number | undefined): string =>
+  typeof v === 'number' && Number.isFinite(v) ? v.toFixed(2) : '-'
+const fmtSignals = (s: Array<{ kind: string; weight: number; value?: string }> | undefined): string =>
+  (s ?? []).map((x) => `${x.kind}:${x.weight}${x.value ? `(${x.value})` : ''}`).join('、') || '-'
+
 /**
  * 拼接控件组里的角色（由 renderStatic 预标注）：
  * - 'mid'      中间格 → 四角全方（radius 0）
@@ -268,6 +274,7 @@ function instanceHtml(n: DesignNode, ctx: Ctx, parent: DesignNode | undefined, i
   const hasDerivedText = parts.length > 0
   if (hasDerivedText) guessed.push('layout-detail') // 未展开的整棵实例树仍要求项目组件做最终实现
   if (parts.some((p) => p.containerStroke)) guessed.push('badge-stroke-color') // 描边几何是设计证据，颜色不是
+  if (parts.some((p) => p.fontInferred)) guessed.push('instance-font') // 某段 derived 字体缺失，沿用同实例上一段
 
   const arrow = k === 'select'
     ? `<svg width="10" height="6" viewBox="0 0 10 6" style="position:absolute;right:11px;top:${px(n.h / 2 - 3)}px"><path d="M1 1l4 4 4-4" stroke="${ds.lineStrong}" stroke-width="1.4" fill="none" stroke-linecap="round"/></svg>`
@@ -416,7 +423,7 @@ export function renderSpecMarkdown(model: DesignModel, ds: Ds, projectName?: str
   const cov = model.coverage
   L.push(`# 设计规格与映射表：${model.componentName}（${model.fileKey} · ${model.nodeId}）`)
   L.push('')
-  L.push(`- 画布：${model.width}×${model.height} · 节点：${model.spec.length}`)
+  L.push(`- 画布：${model.width}×${model.height} · 节点：${model.spec.length}${model.annotations.length ? ` · 设计备注：${model.annotations.length} 条（交互说明，见 0.1）` : ''}${model.titles?.length ? ` · 设计标题：${model.titles.length} 条（见 0.2）` : ''}`)
   L.push(`- 从设计中推断的设计系统常量：行线 \`${ds.line}\`、主色 \`${ds.primary}\`、正文 \`${ds.text}\`、占位 \`${ds.placeholder}\`、圆角 ${ds.radius}px、控件高 ${ds.controlH}px、字体 ${ds.fontFamily}`)
   L.push('')
   L.push('## 0. 属性来源台账（先看这一节）')
@@ -430,6 +437,49 @@ export function renderSpecMarkdown(model: DesignModel, ds: Ds, projectName?: str
     L.push(`- 非 design 项分布：${[...byProp.entries()].map(([k, v]) => `${k}×${v}`).join('、')}`)
   }
   L.push('')
+  if (model.annotations.length) {
+    L.push('## 0.1 设计备注（交互说明，必须实现）')
+    L.push('')
+    L.push('画布上的红字备注**不是 UI 元素**，已从基准页移除；它们是交互/状态要求，实现时必须逐条落实，不能只当注释看一眼。')
+    L.push('')
+    L.push('| # | 备注标题 | 适用组件 | 变体数 | 判定依据 | 置信度 | 处置 | 信号 |')
+    L.push('|---|---|---|---|---|---|---|---|')
+    model.annotations.forEach((a, i) => {
+      const disp = a.disposition === 'candidate' ? '候选·待确认' : '自动'
+      L.push(`| ${i + 1} | ${esc(a.title).replace(/\|/g, '\\|')} | ${esc(a.targetName ?? '未归属')}（${a.targetId ?? '-'}） | ${a.variantIds.length} | ${esc(a.detectedBy.join(' + '))} | ${fmtConf(a.confidence)} | ${disp} | ${esc(fmtSignals(a.signals)).replace(/\|/g, '\\|')} |`)
+    })
+    L.push('')
+    model.annotations.forEach((a, i) => {
+      L.push(`### 备注 ${i + 1}：${esc(a.title)}`)
+      L.push('')
+      L.push(`- 节点：\`${a.id}\` @(${a.x},${a.y}) ${a.w}×${a.h} · 颜色 ${a.color ?? '-'}`)
+      if (a.targetName) L.push(`- 适用：${esc(a.targetName)}（${a.targetId}）${a.variantIds.length > 1 ? ` · 状态变体 ${a.variantIds.join('、')}` : ''}`)
+      L.push(`- 置信度：${fmtConf(a.confidence)} · 处置：${a.disposition === 'candidate' ? '候选·待确认（不得静默丢弃，确认后再落实）' : '自动'} · 信号：${esc(fmtSignals(a.signals))}`)
+      if (a.scope === 'unassigned' || !a.targetName) L.push('- 归属：未归属（scope=unassigned / 无 targetName），需人工确认作用范围')
+      L.push('- 原文：')
+      for (const line of a.text.split('\n')) L.push(`  > ${line || ' '}`)
+      L.push('- 落实要求：按原文实现；在交付说明中逐条回答「用哪个 props/state 承载、在哪个文件实现、如何验证」。')
+      L.push('')
+    })
+  }
+  if (model.titles?.length) {
+    L.push('## 0.2 设计标题（页面/分区标题：命名 + 可访问性依据）')
+    L.push('')
+    L.push('标题文本是**真实 UI**，已在静态基准页按节点正常渲染（不像备注那样被摘除）。实现时用它们确定组件/分区命名与可访问性标题，不要臆造或改写。')
+    L.push('')
+    L.push('| # | 标题文本 | 来源 | 级别 | 证据节点 | 几何/字号 | 置信度 | 信号 |')
+    L.push('|---|---|---|---|---|---|---|---|')
+    model.titles.forEach((t, i) => {
+      const ev = t.nodeId ? `节点 ${t.nodeId}` : '-'
+      const geo = [
+        t.x != null && t.y != null && t.w != null && t.h != null ? `@(${t.x},${t.y}) ${t.w}×${t.h}` : '',
+        t.fontSize != null ? `${t.fontSize}px` : '',
+        t.weight != null ? `weight=${t.weight}` : '',
+      ].filter(Boolean).join(' · ') || '-'
+      L.push(`| ${i + 1} | ${esc(t.text).replace(/\|/g, '\\|')} | ${esc(t.source)} | ${esc(t.level)} | ${esc(ev)} | ${geo} | ${fmtConf(t.confidence)} | ${esc(fmtSignals(t.signals)).replace(/\|/g, '\\|')} |`)
+    })
+    L.push('')
+  }
   L.push('## 1. 静态还原页不是"要搬进项目的样式"')
   L.push('')
   L.push('`index.html` 是**视觉基准**：按 auto-layout 出 flex + 设计稿 literal 色值，只回答"设计长什么样"。')

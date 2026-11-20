@@ -121,6 +121,49 @@ export interface InstanceTextPart {
     containerHeight?: number;
     /** 父 derived 图形自带描边几何（有边框证据，不是"看图像猜"） */
     containerStroke?: boolean;
+    /** 该段 derived 字体缺失，沿用同实例上一段（数据缺口，需在台账标明） */
+    fontInferred?: boolean;
+}
+/**
+ * 一条判定信号：kind 稳定标识 + weight 权重（可正可负）+ value 可读值。
+ * 备注与标题共用；detectedBy 是其人类可读投影。
+ */
+export interface AnnotationSignal {
+    kind: string;
+    weight: number;
+    value?: string;
+}
+/**
+ * 画布上的设计备注（不是产品 UI）：通常是红字说明，写明交互/状态约束。
+ * 只做"识别 + 归属 + 原文透传"，不把备注当需求自由发挥；判定依据一并记录。
+ */
+export interface DesignAnnotation {
+    id: string;
+    /** 原文（保留换行） */
+    text: string;
+    /** 第一行：备注标题 */
+    title: string;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    color?: string;
+    /** 判定依据（人类可读的信号摘要） */
+    detectedBy: string[];
+    /** 备注适用的组件/节点 */
+    targetId?: string;
+    targetName?: string;
+    /** 同一文档帧里的状态变体（备注通常描述整组行为） */
+    variantIds: string[];
+    variantNames: string[];
+    /** 加权打分的全部信号（含未达阈值的弱信号） */
+    signals: AnnotationSignal[];
+    /** 置信度 0..1 = min(1, score/10) */
+    confidence: number;
+    /** auto=从树摘除；candidate=保留在树、audit 待确认 */
+    disposition: 'auto' | 'candidate';
+    /** 归属范围：整组变体 / 单组件 / 无目标 */
+    scope: 'group' | 'single' | 'unassigned';
 }
 export interface DesignTokens {
     colors: Record<string, string>;
@@ -203,6 +246,24 @@ export interface DesignSpecRow {
     /** 属性来源汇总，如 "fill=design,stroke=design,instance=placeholder" */
     prov?: string;
 }
+/**
+ * 组件/页面标题：从显著文本或语义帧名推断，供 codegen 命名与文档使用。
+ * source 标明来源；signals 记录为何选它；level 区分页面标题与分区标题。
+ */
+export interface DesignTitle {
+    text: string;
+    source: 'prominentText' | 'frameName' | 'annotationTitle';
+    nodeId?: string;
+    x?: number;
+    y?: number;
+    w?: number;
+    h?: number;
+    fontSize?: number;
+    weight?: number;
+    level: 'page' | 'section';
+    confidence: number;
+    signals: AnnotationSignal[];
+}
 export interface DesignModel {
     fileKey: string;
     nodeId: string;
@@ -224,6 +285,10 @@ export interface DesignModel {
     spec: DesignSpecRow[];
     /** 属性来源台账（P3）：按 design/inferred/placeholder 统计 + 逐节点明细 */
     coverage: CoverageReport;
+    /** 画布备注：实现时要落实为行为，但**不渲染进 UI** */
+    annotations: DesignAnnotation[];
+    /** 推断出的页面/组件标题（显著文本 / 语义帧名 / 备注标题） */
+    titles: DesignTitle[];
 }
 export interface CoverageReport {
     /** 总节点数（不含隐藏） */
@@ -282,5 +347,12 @@ export declare function overrideTextOf(n: Any): string | undefined;
 export declare function instanceTextPartsOf(n: Any): InstanceTextPart[];
 /** 扁平化（不含隐藏节点） */
 export declare function flatten(model: DesignModel): DesignNode[];
+export declare function extractAnnotations(root: DesignNode): DesignAnnotation[];
+/**
+ * 推断页面/组件标题。CANVAS 根名永不作标题；无语义帧名被 deny-list 过滤。
+ * prominentText 需同时满足：全局最大字号且唯一、>=1.5×正文字号众数、码点<=30、位于画布顶部带。
+ * 候选备注（保留在树里的 red prose）第一行作为 annotationTitle。
+ */
+export declare function extractTitles(root: DesignNode): DesignTitle[];
 export declare function buildDesignModel(nodeJson: Any): DesignModel;
 export {};

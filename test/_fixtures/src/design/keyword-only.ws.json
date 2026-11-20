@@ -1,0 +1,91 @@
+{
+  "fileKey": "TEST",
+  "nodeId": "51:1",
+  "node": {
+    "guid": {
+      "sessionID": 51,
+      "localID": 1
+    },
+    "type": "FRAME",
+    "name": "关键词",
+    "transform": {
+      "m00": 1,
+      "m01": 0,
+      "m02": 0,
+      "m10": 0,
+      "m11": 1,
+      "m12": 0
+    },
+    "size": {
+      "x": 400,
+      "y": 300
+    },
+    "visible": true,
+    "fillPaints": [
+      {
+        "type": "SOLID",
+        "color": {
+          "r": 1,
+          "g": 1,
+          "b": 1,
+          "a": 1
+        },
+        "opacity": 1,
+        "visible": true,
+        "blendMode": "NORMAL"
+      }
+    ]
+  },
+  "descendants": [
+    {
+      "guid": {
+        "sessionID": 51,
+        "localID": 2
+      },
+      "type": "TEXT",
+      "name": "备注",
+      "transform": {
+        "m00": 1,
+        "m01": 0,
+        "m02": 10,
+        "m10": 0,
+        "m11": 1,
+        "m12": 10
+      },
+      "size": {
+        "x": 60,
+        "y": 20
+      },
+      "visible": true,
+      "parentIndex": {
+        "guid": {
+          "sessionID": 51,
+          "localID": 1
+        }
+      },
+      "fillPaints": [
+        {
+          "type": "SOLID",
+          "color": {
+            "r": 0.4,
+            "g": 0.4,
+            "b": 0.4,
+            "a": 1
+          },
+          "opacity": 1,
+          "visible": true,
+          "blendMode": "NORMAL"
+        }
+      ],
+      "textData": {
+        "characters": "备注"
+      },
+      "fontName": {
+        "family": "Noto Sans CJK SC",
+        "style": "Regular"
+      },
+      "fontSize": 14,
+      "autoRename": false
+    }
+  ]
+}

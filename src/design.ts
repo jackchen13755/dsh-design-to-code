@@ -127,6 +127,51 @@ export interface InstanceTextPart {
   containerHeight?: number
   /** 父 derived 图形自带描边几何（有边框证据，不是"看图像猜"） */
   containerStroke?: boolean
+  /** 该段 derived 字体缺失，沿用同实例上一段（数据缺口，需在台账标明） */
+  fontInferred?: boolean
+}
+
+/**
+ * 一条判定信号：kind 稳定标识 + weight 权重（可正可负）+ value 可读值。
+ * 备注与标题共用；detectedBy 是其人类可读投影。
+ */
+export interface AnnotationSignal {
+  kind: string
+  weight: number
+  value?: string
+}
+
+/**
+ * 画布上的设计备注（不是产品 UI）：通常是红字说明，写明交互/状态约束。
+ * 只做"识别 + 归属 + 原文透传"，不把备注当需求自由发挥；判定依据一并记录。
+ */
+export interface DesignAnnotation {
+  id: string
+  /** 原文（保留换行） */
+  text: string
+  /** 第一行：备注标题 */
+  title: string
+  x: number
+  y: number
+  w: number
+  h: number
+  color?: string
+  /** 判定依据（人类可读的信号摘要） */
+  detectedBy: string[]
+  /** 备注适用的组件/节点 */
+  targetId?: string
+  targetName?: string
+  /** 同一文档帧里的状态变体（备注通常描述整组行为） */
+  variantIds: string[]
+  variantNames: string[]
+  /** 加权打分的全部信号（含未达阈值的弱信号） */
+  signals: AnnotationSignal[]
+  /** 置信度 0..1 = min(1, score/10) */
+  confidence: number
+  /** auto=从树摘除；candidate=保留在树、audit 待确认 */
+  disposition: 'auto' | 'candidate'
+  /** 归属范围：整组变体 / 单组件 / 无目标 */
+  scope: 'group' | 'single' | 'unassigned'
 }
 
 export interface DesignTokens {
@@ -208,6 +253,25 @@ export interface DesignSpecRow {
   prov?: string
 }
 
+/**
+ * 组件/页面标题：从显著文本或语义帧名推断，供 codegen 命名与文档使用。
+ * source 标明来源；signals 记录为何选它；level 区分页面标题与分区标题。
+ */
+export interface DesignTitle {
+  text: string
+  source: 'prominentText' | 'frameName' | 'annotationTitle'
+  nodeId?: string
+  x?: number
+  y?: number
+  w?: number
+  h?: number
+  fontSize?: number
+  weight?: number
+  level: 'page' | 'section'
+  confidence: number
+  signals: AnnotationSignal[]
+}
+
 export interface DesignModel {
   fileKey: string
   nodeId: string
@@ -221,6 +285,10 @@ export interface DesignModel {
   spec: DesignSpecRow[]
   /** 属性来源台账（P3）：按 design/inferred/placeholder 统计 + 逐节点明细 */
   coverage: CoverageReport
+  /** 画布备注：实现时要落实为行为，但**不渲染进 UI** */
+  annotations: DesignAnnotation[]
+  /** 推断出的页面/组件标题（显著文本 / 语义帧名 / 备注标题） */
+  titles: DesignTitle[]
 }
 
 export interface CoverageReport {
@@ -495,14 +563,28 @@ export function instanceTextPartsOf(n: Any): InstanceTextPart[] {
       // 只有根文本时没有坐标：按实例的 auto-layout 计算主轴起点/交叉轴距中。
       // 第二个根文本紧接前一个；徽标等 nested derived 不计入普通文本流。
       const layout = n
-      const horizontal = String(layout.stackMode ?? '').toUpperCase() === 'HORIZONTAL'
-      const tl = text.layoutSize ?? d.size ?? {}
       const rootTexts = overrides.filter((it: Any) => it?.textData?.characters && it.guidPath?.guids?.length === 1)
-      const contentW = rootTexts.reduce((sum: number, _it: Any, i: number) => {
-        const dd = byPath.get(guidPathOf(rootTexts[i])) ?? {}
-        return sum + point(dd.derivedTextData?.layoutSize?.x ?? dd.size?.x)
-      }, 0)
-      const total = contentW + point(layout.stackSpacing) * Math.max(0, rootTexts.length - 1)
+      const measure = (it: Any): { w: number; h: number } => {
+        const dd = byPath.get(guidPathOf(it)) ?? {}
+        const ls = dd.derivedTextData?.layoutSize ?? dd.size ?? {}
+        const fs = Number(dd.derivedTextData?.glyphs?.[0]?.fontSize) || 14
+        // 只用于判断主轴方向；缺失尺寸按字符数估宽、按字号估高，不当成精确几何。
+        return {
+          w: point(ls.x) || Math.ceil(String(it.textData?.characters ?? '').length * fs * 0.6),
+          h: point(ls.y) || Math.ceil(fs * 1.4),
+        }
+      }
+      const measures: Array<{ w: number; h: number }> = rootTexts.map(measure)
+      const contentW = measures.reduce((sum: number, m: { w: number }) => sum + m.w, 0)
+      const contentH = measures.reduce((sum: number, m: { h: number }) => sum + m.h, 0)
+      const spacing = point(layout.stackSpacing)
+      const total = contentW + spacing * Math.max(0, rootTexts.length - 1)
+      const stackMode = String(layout.stackMode ?? '').toUpperCase()
+      // 没有 stackMode 的实例（常见于日期范围选择框）不能默认竖排：
+      // 若容器高度装不下两行文字、宽度装得下一行，主轴只能是水平的。
+      const horizontal = stackMode === 'HORIZONTAL'
+        || (!stackMode && point(n.size?.x) >= total && point(n.size?.y) < contentH)
+      const tl = point(text.layoutSize?.x) || point(d.size?.x) ? (text.layoutSize ?? d.size ?? {}) : { x: measure(o).w, y: measure(o).h }
       const centered = String(layout.stackPrimaryAlignItems ?? '').toUpperCase() === 'CENTER'
       const xStart = point(layout.stackHorizontalPadding) + (centered ? Math.max(0, (point(n.size?.x) - point(layout.stackHorizontalPadding) * 2 - total) / 2) : 0)
       const crossPad = point(layout.stackVerticalPadding)
@@ -524,15 +606,33 @@ export function instanceTextPartsOf(n: Any): InstanceTextPart[] {
         plainOffset += point(tl.y) + point(layout.stackSpacing)
       }
     }
-    const size = glyphSize || point(n.fontSize) || 14
-    const lh = Number(lhs)
+    // 段级真实字号优先（glyphSize），实例级 fontSize 兜底；两者都没有才算缺失。
+    const sizeFromData = glyphSize || point(n.fontSize)
+    const weightFromData = Number(meta.fontWeight) || 0
+    let size = sizeFromData || 14
+    let family = String(font.family ?? '')
+    let weight = weightFromData || 400
+    let lineHeight = Number(lhs) > 0 ? `${Math.round(Number(lhs) * 100) / 100}px` : undefined
+    let fontInferred = false
+    if (!family) {
+      // 有的覆写段只有 characters、没有 derived 字体（日期范围第二个值常见）：
+      // 同一实例内文字样式相同，沿用上一段并标为推断，不冒充完整数据。
+      // 但该段自带的真实 glyphSize / fontWeight 必须保留，不能被上一段覆盖。
+      const prev = [...parts].reverse().find((p) => p.family)
+      if (prev) {
+        family = prev.family
+        if (!weightFromData) weight = prev.weight
+        if (!sizeFromData) size = prev.size
+        lineHeight = lineHeight ?? prev.lineHeight
+        fontInferred = true
+      }
+    }
     parts.push({
       path, value: String(value), x, y,
       w: point(text.layoutSize?.x ?? d.size?.x),
       h: point(text.layoutSize?.y ?? d.size?.y),
-      size, family: String(font.family ?? ''), weight: Number(meta.fontWeight) || 400,
-      lineHeight: lh > 0 ? `${Math.round(lh * 100) / 100}px` : undefined,
-      hasPosition, containerWidth, containerHeight, containerStroke,
+      size, family, weight, lineHeight,
+      hasPosition, containerWidth, containerHeight, containerStroke, fontInferred,
     })
   }
   return parts
@@ -715,6 +815,361 @@ export function flatten(model: DesignModel): DesignNode[] {
   return out
 }
 
+/** CSS 颜色 → {r,g,b,a}（0..1）。支持 #rgb/#rrggbb/#rrggbbaa、rgb()/rgba()；解析失败返回 undefined。 */
+function parseCssColor(input?: string): { r: number; g: number; b: number; a: number } | undefined {
+  const s = String(input ?? '').trim().toLowerCase()
+  if (!s) return undefined
+  let m = /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/.exec(s)
+  if (m) {
+    const h = m[1]
+    const expand = (x: string) => x.length === 1 ? x + x : x
+    if (h.length === 3 || h.length === 4) {
+      return {
+        r: parseInt(expand(h[0]), 16) / 255,
+        g: parseInt(expand(h[1]), 16) / 255,
+        b: parseInt(expand(h[2]), 16) / 255,
+        a: h.length === 4 ? parseInt(expand(h[3]), 16) / 255 : 1,
+      }
+    }
+    return {
+      r: parseInt(h.slice(0, 2), 16) / 255,
+      g: parseInt(h.slice(2, 4), 16) / 255,
+      b: parseInt(h.slice(4, 6), 16) / 255,
+      a: h.length === 8 ? parseInt(h.slice(6, 8), 16) / 255 : 1,
+    }
+  }
+  m = /^rgba?\(([^)]+)\)$/.exec(s)
+  if (m) {
+    const parts = m[1].split(/[\s,/]+/).filter(Boolean).map(Number)
+    if (parts.length >= 3 && parts.slice(0, 3).every(Number.isFinite)) {
+      const norm = (v: number) => v > 1 ? v / 255 : v
+      const a = parts.length >= 4 && Number.isFinite(parts[3]) ? (parts[3] > 1 ? parts[3] / 255 : parts[3]) : 1
+      return { r: norm(parts[0]), g: norm(parts[1]), b: norm(parts[2]), a }
+    }
+  }
+  return undefined
+}
+
+/** RGB → HSL（h 0..360，s/l 0..1） */
+function rgbToHsl({ r, g, b }: { r: number; g: number; b: number }): { h: number; s: number; l: number } {
+  const max = Math.max(r, g, b)
+  const min = Math.min(r, g, b)
+  const l = (max + min) / 2
+  const d = max - min
+  const s = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1))
+  let h = 0
+  if (d !== 0) {
+    if (max === r) h = ((g - b) / d) % 6
+    else if (max === g) h = (b - r) / d + 2
+    else h = (r - g) / d + 4
+    h = (h * 60 + 360) % 360
+  }
+  return { h, s, l }
+}
+
+/**
+ * 扩展红域：饱和玫红/正红（#e72847 一类）及其相邻色域——不再硬编码单一色值。
+ * hue 320°..30°、s>=0.35、l 0.2..0.8，支持 rgba / #rgb / #rrggbbaa。
+ * 低饱和灰字、蓝色强调字、浅红底都不会命中。
+ */
+function isNoteRed(color?: string): boolean {
+  const c = parseCssColor(color)
+  if (!c || c.a < 0.35) return false
+  const { h, s, l } = rgbToHsl(c)
+  return (h >= 320 || h <= 30) && s >= 0.35 && l >= 0.2 && l <= 0.8
+}
+
+/**
+ * 颜色信号（泛化）：扩展红域命中，或「偏红且相对同层主流文案色有明显色差」。
+ * mainstream 为同层 TEXT 中最常见的字色（排除候选自身）；主流色本身偏红时不误报。
+ */
+function colorAnnotationSignal(color: string | undefined, mainstream: string | undefined): boolean {
+  const c = parseCssColor(color)
+  if (!c || c.a < 0.35) return false
+  // 扩展红域是独立充分条件：即使同层主流色恰好也是红字（如另一条备注），仍算命中。
+  if (isNoteRed(color)) return true
+  // 弱判据：偏红且与同层主流文案色有明显色差。
+  const reddish = c.r - c.g >= 0.18 && c.r - c.b >= 0.10
+  if (!reddish) return false
+  if (!mainstream) return true
+  const mc = parseCssColor(mainstream)
+  if (!mc) return true
+  const dist = Math.abs(c.r - mc.r) + Math.abs(c.g - mc.g) + Math.abs(c.b - mc.b)
+  return dist >= 0.25
+}
+
+// 关键词只是弱证据（+1），绝不作为必要条件；去掉对中文有害的 \b（中文不是 \w，\b 会误判边界）。
+const NOTE_KEYWORD = /^(备注|说明|注意|提示|标注|注[:：]|annotation|note)/i
+const NOTE_TEXT_KEYWORD = /^(备注|说明|注意|提示|标注|注[:：])/
+
+/** 码点长度（JS length 会把代理对算成 2，这里按 Unicode 码点数） */
+const cpLen = (s: string): number => [...s].length
+
+/** 句读标点：中英文逗号/句号/问号/叹号/分号/顿号/引号等 */
+const SENTENCE_PUNCT_RE = /[。！？；，、：．!?,;:“”‘’「」『』（）()]/
+
+/** 行为词（弱证据，多语言）：描述交互/状态约束，而非产品静态标签 */
+const BEHAVIOR_RE = /可点击|点击|激活|不可编辑|编辑态|自动|选择|切换|展开|折叠|显示|隐藏|禁用|启用|只读|必填|默认|支持|方可|才会|只有|enable|disable|click|tap|auto|select|toggle|expand|collapse|show|hide|editable|readonly|active/i
+
+/** 无语义帧名：Page 1 / Frame N / Untitled / 设计组件 / 纯数字 等，不作组件标题 */
+const TITLE_FRAME_DENY = /^(page\s*\d+|frame\s*\d+|untitled|设计组件|component\s*\d+|group\s*\d+|section\s*\d+|画布|图层|\d+)$/i
+
+/** 众数：出现次数最多的值；并列取先出现者，空集返回 undefined */
+function modeOf<T>(xs: T[]): T | undefined {
+  const counts = new Map<T, number>()
+  for (const x of xs) counts.set(x, (counts.get(x) ?? 0) + 1)
+  let best: T | undefined
+  let max = 0
+  for (const [x, n] of counts) if (n > max) { max = n; best = x }
+  return best
+}
+
+/** 同层 TEXT 兄弟节点的主流字色（出现最多者，排除候选自身） */
+function mainstreamTextColor(siblings: DesignNode[], excludeId: string): string | undefined {
+  return modeOf(siblings
+    .filter((s) => s.id !== excludeId && s.kind === 'text' && s.text?.color)
+    .map((s) => s.text!.color!))
+}
+
+/** 同层 TEXT 兄弟节点的正文字号众数（排除候选自身） */
+function bodyFontSizeMode(siblings: DesignNode[], excludeId: string): number | undefined {
+  return modeOf(siblings
+    .filter((s) => s.id !== excludeId && s.kind === 'text' && (s.text?.size ?? 0) > 0)
+    .map((s) => s.text!.size))
+}
+
+/** 名字是否≈正文（autoRename 的 Figma 语义）：去空白/标点后比较 */
+function nameMatchesText(name: string, text: string): boolean {
+  const norm = (s: string) => s.replace(/[\s\u200b]/g, '')
+    .replace(/[“”‘’「」『』]/g, '').replace(/[，,。.！!？?；;：:]/g, '')
+  const a = norm(name)
+  const b = norm(text)
+  return a.length > 0 && a === b
+}
+
+/**
+ * 识别画布备注：加权打分，任一信号都不是必要条件。
+ * 阈值：score>=7 → auto（从树摘除）；4<=score<7 → candidate（保留在树，audit 标待确认）；<4 → 普通 UI 文案不动。
+ * 信号（建议值）：根直连+2 / 同名变体组+2 / 几何在组件外+2 / 扩展红域或色差+2 / prose≥12且含句读+2 /
+ *   行为词+1 / autoRename且名≈正文+1 / 字号字重异于正文+1 / 关键词+1（弱，非必要）。
+ */
+interface ScoredAnnotation {
+  annotation: DesignAnnotation
+  score: number
+  auto: boolean
+}
+
+export function extractAnnotations(root: DesignNode): DesignAnnotation[] {
+  const out: DesignAnnotation[] = []
+
+  const visit = (parent: DesignNode, depth: number): void => {
+    const kids = parent.children
+    const frames = kids.filter((c) => c.kind !== 'text' && c.type !== 'TEXT')
+    const nameCount = new Map<string, number>()
+    for (const f of frames) nameCount.set(f.name, (nameCount.get(f.name) ?? 0) + 1)
+    const groupCount = Math.max(0, ...nameCount.values())
+    const hasVariantGroup = groupCount >= 2
+    const kept: DesignNode[] = []
+
+    for (const child of kids) {
+      // 隐藏层不是设计意图：与 flatten/extractTitles 一致，隐藏节点不参与备注判定。
+      // 保留在树里（不渲染），但不摘除、不进 requirements。
+      if (child.raw?.visible === false) { kept.push(child); continue }
+      let scored: ScoredAnnotation | undefined
+      if (child.kind === 'text') {
+        const signals: AnnotationSignal[] = []
+        const reasons: string[] = []
+        let score = 0
+        const add = (kind: string, weight: number, value: string | undefined, reason: string): void => {
+          signals.push({ kind, weight, ...(value != null ? { value } : {}) })
+          reasons.push(reason)
+          score += weight
+        }
+
+        const text = String(child.value ?? '').trim()
+        const textSiblings = kids
+        // 1) 根直连子节点（visit 的 depth 是父节点深度，根为 0）
+        if (depth === 0) add('rootDirectChild', 2, undefined, '根直连子节点')
+        // 2) 同名变体组
+        if (hasVariantGroup) add('variantGroup', 2, `同名帧×${groupCount}`, '同名变体组')
+        // 3) 几何位于组件外（与所有兄弟 frame 都不相交）
+        const outside = frames.length > 0 && frames.every((f) =>
+          f.x + f.w <= child.x || child.x + child.w <= f.x || f.y + f.h <= child.y || child.y + child.h <= f.y)
+        if (outside) add('outsideGeometry', 2, undefined, '几何位于组件外的留白区')
+        // 4) 颜色：扩展红域 / 相对同层主流文案色的色差
+        const mainstream = mainstreamTextColor(textSiblings, child.id)
+        const color = child.text?.color
+        if (colorAnnotationSignal(color, mainstream)) add('noteColor', 2, color, '备注红/色差')
+        // 5) prose 长度≥12 码点且含句读标点
+        if (cpLen(text) >= 12 && SENTENCE_PUNCT_RE.test(text)) add('prosePunct', 2, `${cpLen(text)}码点`, 'prose≥12且含句读')
+        // 6) 行为词（弱，多语言）
+        if (BEHAVIOR_RE.test(text) || BEHAVIOR_RE.test(child.name)) add('behaviorWord', 1, undefined, '行为词')
+        // 7) autoRename 且 name≈正文
+        if (child.raw?.autoRename === true && nameMatchesText(child.name, text)) add('autoRenameNameEqText', 1, undefined, 'autoRename且名≈正文')
+        // 8) 字号/字重异于同层 UI 正文
+        const bodySize = bodyFontSizeMode(textSiblings, child.id)
+        const sizeDiff = bodySize != null && (child.text?.size ?? 0) > 0 && child.text!.size !== bodySize
+        const bodyWeight = modeOf(textSiblings
+          .filter((s) => s.id !== child.id && s.kind === 'text' && (s.text?.weight ?? 0) > 0)
+          .map((s) => s.text!.weight))
+        const weightDiff = bodyWeight != null && (child.text?.weight ?? 0) > 0 && child.text!.weight !== bodyWeight
+        if (sizeDiff || weightDiff) add('fontDiffersFromBody', 1, `size=${child.text?.size}/${bodySize} weight=${child.text?.weight}/${bodyWeight}`, '字号/字重异于正文')
+        // 9) 关键词（弱，绝不作为必要条件）
+        const keyword = NOTE_KEYWORD.test(child.name) || NOTE_TEXT_KEYWORD.test(text)
+        if (keyword) add('keyword', 1, undefined, '名称/正文含备注关键词')
+
+        // 结构信号（根直连/变体组/几何）只提供权重，不能单独把 UI 文案抬成备注：
+        // 至少要有「颜色」或「prose」这类内容信号。这是单一弱门槛，不是全信号硬合取。
+        const hasContentSignal = signals.some((s) => s.kind === 'noteColor' || s.kind === 'prosePunct')
+        if (score >= 4 && hasContentSignal) {
+          const disposition: 'auto' | 'candidate' = score >= 7 ? 'auto' : 'candidate'
+          // 归属：优先整组变体；否则取纵向最近的组件；再否则 unassigned
+          let targetId: string | undefined
+          let targetName: string | undefined
+          let variantIds: string[] = []
+          let variantNames: string[] = []
+          let scope: 'group' | 'single' | 'unassigned' = 'unassigned'
+          if (hasVariantGroup) {
+            targetId = parent.id
+            targetName = parent.name
+            variantIds = frames.map((f) => f.id)
+            variantNames = frames.map((f) => f.name)
+            scope = 'group'
+          } else if (frames.length) {
+            const cy = child.y + child.h / 2
+            const nearest = [...frames].sort((a, b) =>
+              Math.abs(a.y + a.h / 2 - cy) - Math.abs(b.y + b.h / 2 - cy))[0]
+            targetId = nearest.id
+            targetName = nearest.name
+            variantIds = [nearest.id]
+            variantNames = [nearest.name]
+            scope = 'single'
+          }
+          scored = {
+            score,
+            auto: disposition === 'auto',
+            annotation: {
+              id: child.id, text, title: text.split('\n')[0].trim(),
+              x: child.x, y: child.y, w: child.w, h: child.h,
+              color: child.text?.color,
+              detectedBy: reasons,
+              targetId, targetName, variantIds, variantNames,
+              signals,
+              confidence: Math.min(1, score / 10),
+              disposition,
+              scope,
+            },
+          }
+        }
+      }
+      // 命中（含 candidate）都要记进 annotations；只有 auto 才从树里摘除。
+      if (scored) out.push(scored.annotation)
+      if (scored && scored.auto) continue
+      kept.push(child)
+    }
+
+    parent.children = kept
+    for (const child of kept) visit(child, depth + 1)
+  }
+
+  visit(root, 0)
+  return out
+}
+
+/**
+ * 推断页面/组件标题。CANVAS 根名永不作标题；无语义帧名被 deny-list 过滤。
+ * prominentText 需同时满足：全局最大字号且唯一、>=1.5×正文字号众数、码点<=30、位于画布顶部带。
+ * 候选备注（保留在树里的 red prose）第一行作为 annotationTitle。
+ */
+export function extractTitles(root: DesignNode): DesignTitle[] {
+  const out: DesignTitle[] = []
+  const seenTextIds = new Set<string>()
+  const seenFrameNames = new Set<string>()
+
+  const all: DesignNode[] = []
+  const walk = (n: DesignNode): void => {
+    if (n.raw?.visible === false) return
+    all.push(n)
+    for (const c of n.children) walk(c)
+  }
+  walk(root)
+
+  const texts = all.filter((n) => n.kind === 'text' && n.value && n.text && (n.text.size ?? 0) > 0)
+  const sizes = texts.map((n) => n.text!.size)
+  const bodyMode = modeOf(sizes)
+  const maxSize = sizes.length ? Math.max(...sizes) : 0
+  const maxCount = sizes.filter((s) => s === maxSize).length
+
+  // 1) prominentText：全局最大字号且唯一 + >=1.5×正文众数 + 码点<=30 + 顶部带
+  if (texts.length && bodyMode != null && maxCount === 1 && maxSize >= bodyMode * 1.5) {
+    const cand = texts.find((n) => n.text!.size === maxSize)!
+    const cp = cpLen(cand.value!)
+    const topBand = root.h > 0 ? cand.y <= Math.max(root.h * 0.25, 80) : true
+    if (cp <= 30 && topBand) {
+      out.push({
+        text: cand.value!.trim(),
+        source: 'prominentText',
+        nodeId: cand.id,
+        x: cand.x, y: cand.y, w: cand.w, h: cand.h,
+        fontSize: maxSize, weight: cand.text!.weight,
+        level: 'page',
+        confidence: Math.min(1, Number((0.7 + 0.1 * (maxSize / bodyMode)).toFixed(3))),
+        signals: [
+          { kind: 'maxFontSizeUnique', weight: 2, value: `${maxSize}px` },
+          { kind: 'sizeVsBodyMode', weight: 2, value: `${(maxSize / bodyMode).toFixed(2)}x` },
+          { kind: 'codepoints<=30', weight: 1, value: `${cp}` },
+          { kind: 'topBand', weight: 1, value: `y=${Math.round(cand.y)}` },
+        ],
+      })
+      seenTextIds.add(cand.id)
+    }
+  }
+
+  // 2) frameName：语义帧名，CANVAS 根名跳过、deny-list 过滤、按名字去重
+  const frames = all.filter((n) =>
+    (n.type === 'FRAME' || n.type === 'GROUP' || n.type === 'SECTION' || n.kind === 'frame') && n.name && n.name.trim())
+  for (const f of frames) {
+    if (f === root && f.type === 'CANVAS') continue
+    const name = f.name.trim()
+    if (TITLE_FRAME_DENY.test(name) || seenFrameNames.has(name)) continue
+    seenFrameNames.add(name)
+    out.push({
+      text: name,
+      source: 'frameName',
+      nodeId: f.id,
+      x: f.x, y: f.y, w: f.w, h: f.h,
+      level: f === root ? 'page' : 'section',
+      confidence: f === root ? 0.8 : 0.65,
+      signals: [
+        { kind: 'semanticFrameName', weight: 2, value: name },
+        ...(f === root ? [{ kind: 'rootFrame', weight: 1 }] : []),
+      ],
+    })
+  }
+
+  // 3) annotationTitle：留在树里的候选备注（红字 prose）第一行当标题
+  for (const n of texts) {
+    if (seenTextIds.has(n.id)) continue
+    if (isNoteRed(n.text!.color) && cpLen(n.value!) >= 12) {
+      out.push({
+        text: n.value!.split('\n')[0].trim(),
+        source: 'annotationTitle',
+        nodeId: n.id,
+        x: n.x, y: n.y, w: n.w, h: n.h,
+        fontSize: n.text!.size, weight: n.text!.weight,
+        level: 'section',
+        confidence: 0.6,
+        signals: [
+          { kind: 'annotationLikeText', weight: 2 },
+          { kind: 'noteColor', weight: 2, value: n.text!.color },
+        ],
+      })
+    }
+  }
+
+  return out
+}
+
 export function buildDesignModel(nodeJson: Any): DesignModel {
   const node = nodeJson.node as Any
   const descendants = (nodeJson.descendants ?? []) as Any[]
@@ -729,6 +1184,10 @@ export function buildDesignModel(nodeJson: Any): DesignModel {
   }
 
   const tree = buildTree(node, childrenMap, 0, 0, 0)
+  // 备注是交互说明：从 UI 树里摘掉（不能画进基准页），但必须进 SPEC/Prompt。
+  // 先摘备注再提标题：auto 备注已不在树里，不会污染 prominentText/frameName。
+  const annotations = extractAnnotations(tree)
+  const titles = extractTitles(tree)
 
   const colors = new Map<string, string>()
   const fonts = new Map<string, { family: string; weight: string; size: number; lineHeight?: string; letterSpacing?: string }>()
@@ -854,5 +1313,7 @@ export function buildDesignModel(nodeJson: Any): DesignModel {
     tree,
     spec,
     coverage,
+    annotations,
+    titles,
   }
 }
