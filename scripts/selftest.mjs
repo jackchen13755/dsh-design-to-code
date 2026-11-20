@@ -271,6 +271,8 @@ try {
 try {
   const base = {
     stage: 'skeleton_generated', nodeId: '1:1', fileKey: 'k', confirmed: true, gateVersion: GATE_VERSION,
+    // GATE_VERSION=3 起收尾必须有一次干净的机器视觉回归（fail-closed）。
+    visualDiff: { at: '', checked: true, findings: 0, clean: true, reportPath: '' },
     updatedAt: '', reviews: [{
       round: 1, reviewer: 'x', at: '', scope: 'implementation', verdict: 'pass',
       items: [{ id: '1.1', severity: 'minor', text: '微调', status: 'closed' }],
@@ -279,6 +281,8 @@ try {
   assert(!evaluateCloseGate({ flow: null }).ok, '门禁：缺 flow.json → 拒绝（fail-closed）')
   assert(!evaluateCloseGate({ flow: { ...base, gateVersion: undefined } }).ok, '门禁：旧版本目录 → 拒绝')
   assert(!evaluateCloseGate({ flow: { ...base, confirmed: false } }).ok, '门禁：confirmed=false → 拒绝')
+  assert(!evaluateCloseGate({ flow: { ...base, visualDiff: undefined } }).ok, '门禁：缺视觉回归 artifact → 拒绝（fail-closed）')
+  assert(!evaluateCloseGate({ flow: { ...base, visualDiff: { ...base.visualDiff, clean: false } } }).ok, '门禁：视觉回归未 clean 且无 knownDiffs → 拒绝')
   assert(!evaluateCloseGate({ flow: { ...base, reviews: [{ ...base.reviews[0], verdict: 'reject' }] } }).ok, '门禁：末轮 reject → 拒绝')
   assert(!evaluateCloseGate({ flow: { ...base, reviews: [{ ...base.reviews[0], items: [{ id: '1.1', severity: 'major', text: '未关闭', status: 'open' }] }] } }).ok, '门禁：有未关闭实现项 → 拒绝')
   assert(evaluateCloseGate({ flow: base }).ok, '门禁：干净状态 → 放行')

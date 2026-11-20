@@ -4,7 +4,7 @@
  */
 import type { KnownDiff, ReviewRoundState } from './review.js';
 /** 门禁契约版本：旧 flow.json 没有这个字段 = 用旧门禁写的状态（confirmed 可能是错的），一律要求重新确认 */
-export declare const GATE_VERSION = 2;
+export declare const GATE_VERSION = 3;
 export interface FlowState {
     stage: 'static_rendered' | 'skeleton_generated' | 'change_brief_ready';
     nodeId: string;
@@ -33,6 +33,18 @@ export interface FlowState {
     forceReason?: string;
     /** 已确认接受的差异（known-diffs）：命中即标 accepted，不再重复提出、不阻塞收尾 */
     knownDiffs?: KnownDiff[];
+    /**
+     * 自动视觉回归（figma_visual_diff）的最近一次结果。
+     * 缺字段 / clean=false 且没有被 knownDiffs 接受时，收尾门禁拒绝（fail-closed）。
+     * checked=本次是否真的取到了可对照节点；findings=差异条数；clean=findings=0 且无未接受差异。
+     */
+    visualDiff?: {
+        at: string;
+        checked: boolean;
+        findings: number;
+        clean: boolean;
+        reportPath: string;
+    };
     /** 属性来源台账摘要（placeholder 占比），门禁与交付说明引用 */
     coverage?: {
         nodes: number;

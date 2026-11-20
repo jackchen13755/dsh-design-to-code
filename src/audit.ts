@@ -194,6 +194,17 @@ export function auditModel(model: DesignModel): AuditResult {
     missing.add(`【图标库映射】${libraryIcons.length} 个：${libraryIcons.map((n) => `${n.id} ${n.name}→${iconRefOf(n)!.name}`).join('、')}。使用库中的原始 SVG/项目图标组件，禁止自绘路径。`)
   }
 
+  // ── 显式存疑：tally 众数 / 默认字面量推断出来的颜色，不是该节点设计原值 ──
+  // 不静默当"已确认"：进 missing 并标「存疑·需确认」，让会话按 literal / 挂起确认，而不是照抄推断色。
+  const guessBasis = new Set(['tally-inferred', 'default'])
+  for (const s of model.suspects ?? []) {
+    if (!guessBasis.has(s.basis)) continue
+    const where = s.nodeId ? `${s.nodeId} ${s.name}` : (s.name || '(ds 推断)')
+    missing.add(
+      `【存疑·需确认】${where} · ${s.property}=${s.guessedValue}（${s.basis}）：${s.evidence}。${s.action}`,
+    )
+  }
+
   return {
     fileKey: model.fileKey,
     nodeId: model.nodeId,

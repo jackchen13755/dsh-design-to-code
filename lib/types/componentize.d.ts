@@ -67,6 +67,17 @@ export interface DesignSection {
  * 内容区里再按它的直接子级容器（各业务节）细分。
  */
 export declare function detectSections(model: DesignModel): DesignSection[];
+/**
+ * 子树里所有会打 data-design-id 的节点 id（含自身，跳过不可见子树）。
+ * 这是组件对比锚点的**唯一口径**：组件文件顶部注释、CODEGEN_PROMPT 的组件边界契约、
+ * visual_diff 的单组件过滤三处都用它，保证不遗漏、不跨组件重复归属。
+ */
+export declare function subtreeDesignIds(model: DesignModel, nodeId: string): string[];
+/**
+ * detectSections 的可靠性闸门：空、或只把整页根当成一个"分区" → 不可靠，
+ * 退回仅重复组件的现状（不生成"整页组件"这种没有拆分意义的垃圾文件）。
+ */
+export declare function reliableSections(model: DesignModel, sections: DesignSection[]): DesignSection[];
 /** 设计侧实例名 → 建议复用的项目组件（启发式；最终以项目实际为准） */
 export declare function reuseHints(model: DesignModel): ReuseHint[];
 /** 探测目标仓库的组件约定（组件根目录 / 目录形态 / 样式后缀 / barrel / 现成组件名） */

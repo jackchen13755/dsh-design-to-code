@@ -13,10 +13,11 @@
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import type { DesignModel, DesignNode } from './design.js'
+import type { DesignModel, DesignNode, SuspectItem } from './design.js'
 import { inferDesignSystem, specTable } from './render-static.js'
 import { borderPaint, flexDecls, flowChildDecls, flowsInParent, orderFlow, radiusDecl, rootCssDecls } from './layout.js'
-import { detectRepeats, detectSections, reuseHints, renderComponentPlan, type RepeatGroup } from './componentize.js'
+import { detectRepeats, detectSections, reliableSections, subtreeDesignIds, reuseHints, renderComponentPlan, type RepeatGroup, type DesignSection } from './componentize.js'
+import { renderRequirementsCrosswalk } from './requirements-crosswalk.js'
 import type { AuditResult } from './audit.js'
 import { iconRefOf } from './icons.js'
 
@@ -63,6 +64,26 @@ function textValuesOf(root: DesignNode): string[] {
   return out
 }
 
+/** 给顶层分区派生 props：从子树里的文案按渲染顺序取（与组件文件渲染循环的 propIdx 对齐） */
+function propsForSubtree(root: DesignNode, max = 8): RepeatGroup['props'] {
+  const out: RepeatGroup['props'] = []
+  const used = new Set<string>()
+  for (const t of flat([root])) {
+    if (t.id === root.id) continue
+    if (t.kind !== 'text' && !(t.type === 'INSTANCE' && t.value)) continue
+    const text = String(t.value ?? '').trim()
+    if (!text || text.length > 20) continue
+    let name = text.replace(/[^A-Za-z0-9]+/g, ' ').trim().split(/\s+/)
+      .map((w) => w.charAt(0).toLowerCase() + w.slice(1)).join('') || `text${out.length + 1}`
+    if (!/^[a-zA-Z]/.test(name)) name = `text${out.length + 1}`
+    while (used.has(name)) name = `${name}Alt`
+    used.add(name)
+    out.push({ name, type: 'string', sample: text, nodeId: t.id })
+    if (out.length >= max) break
+  }
+  return out
+}
+
 function flat(nodes: DesignNode[]): DesignNode[] {
   const out: DesignNode[] = []
   const walk = (n: DesignNode): void => {
@@ -92,6 +113,58 @@ const fmtConf = (v: number | undefined): string =>
 const fmtSignals = (s: Array<{ kind: string; weight: number; value?: string }> | undefined): string =>
   (s ?? []).map((x) => `${x.kind}:${x.weight}${x.value ? `(${x.value})` : ''}`).join('、') || '-'
 
+/** C1 SuspectItem（design.ts 定义，本席位只读消费）；运行时字段可能尚未落地，按空数组兜底。 */
+const suspectsOf = (m: DesignModel): SuspectItem[] => m.suspects ?? []
+
+type SpecRow = DesignModel['spec'][number]
+const cellOf = (s: unknown): string => escText(s).replace(/\|/g, '\\|')
+
+/** 细节核对表：从 model.tokens / model.spec 自动填设计 literal（不是近似值）。
+ *  prov=placeholder/inferred（data-guessed）或命中 C1 suspects 的行标「存疑·需确认，不得静默套用」。 */
+function detailChecklist(model: DesignModel): string[] {
+  const suspects = suspectsOf(model)
+  const suspectIds = new Set(suspects.map((s) => String(s.nodeId ?? '')).filter(Boolean))
+  const suspectProps = new Set(suspects.map((s) => `${String(s.nodeId ?? '')}|${String(s.property ?? '')}`))
+  const flagged = (row: SpecRow, prop: string): boolean =>
+    suspectIds.has(row.id) ||
+    suspectProps.has(`${row.id}|${prop}`) ||
+    /placeholder|inferred|guessed/.test(String(row.prov ?? ''))
+  const out: string[] = []
+  const row = (attr: string, value: string, tol: string, how: string, sr?: SpecRow, prop?: string): void => {
+    const v = sr && prop && flagged(sr, prop) ? `存疑·需确认，不得静默套用（原值 ${value}）` : value
+    out.push(`| ${cellOf(attr)} | ${cellOf(v)} | ${cellOf(tol)} | ${cellOf(how)} |`)
+  }
+  const tokens = model.tokens ?? { colors: {}, fonts: {}, spacing: [], shadows: [] }
+  for (const [k, v] of Object.entries(tokens.colors)) {
+    row(`令牌 ${k}（色值）`, v, '0（逐字相等）', 'getComputedStyle(el).color / backgroundColor / borderColor 与该 literal 逐字对比')
+  }
+  for (const [k, v] of Object.entries(tokens.fonts)) {
+    row(`令牌 ${k}（字号/行高）`, `${v.size}px / ${v.lineHeight ?? '-'}`, '±0.5px', 'getComputedStyle(el).fontSize / lineHeight')
+  }
+  tokens.spacing.forEach((v, i) => {
+    row(`令牌 spacing[${i}]（gap）`, `${v}px`, '±1px', 'getComputedStyle(el).gap / columnGap / rowGap')
+  })
+  const HOW = {
+    bg: 'getComputedStyle(el).backgroundColor',
+    color: 'getComputedStyle(el).color',
+    font: 'getComputedStyle(el).fontSize / lineHeight',
+    dash: 'getComputedStyle(el).background-image（repeating-linear-gradient）或 SVG stroke-dasharray',
+    border: 'getComputedStyle(el).borderTopWidth / RightWidth / BottomWidth / LeftWidth + borderStyle',
+    radius: 'getComputedStyle(el).borderTopLeftRadius / TopRightRadius / BottomRightRadius / BottomLeftRadius',
+    text: 'el.textContent 与设计原文逐字对比',
+  }
+  for (const s of model.spec ?? []) {
+    if (s.background) row(`${s.id} ${s.name} 背景色`, s.background, '0（逐字相等）', HOW.bg, s, 'fill')
+    if (s.color) row(`${s.id} ${s.name} 文字色`, s.color, '0（逐字相等）', HOW.color, s, 'text')
+    if (s.font) row(`${s.id} ${s.name} 字号/行高`, s.font, '±0.5px', HOW.font, s, 'font')
+    if (s.dash) row(`${s.id} ${s.name} 虚线`, `dashPattern=${s.dash}`, '段长逐字相等', HOW.dash, s, 'stroke')
+    if (s.border || s.borderEdges) row(`${s.id} ${s.name} 逐边描边`, `${s.borderEdges ?? ''} ${s.border ?? ''}`.trim(), '±0.5px', HOW.border, s, 'stroke')
+    if (s.radius) row(`${s.id} ${s.name} 逐角圆角`, s.radius, '±1px', HOW.radius, s, 'radius')
+    if (s.text) row(`${s.id} ${s.name} 文案`, s.text, '0（逐字相等）', HOW.text, s, 'text')
+  }
+  return out
+}
+
 interface InstKindRule { re: RegExp; tag: string }
 const INSTANCE_RULES: InstKindRule[] = [
   { re: /hand|cursor|光标/i, tag: 'skip' },
@@ -115,13 +188,30 @@ function borderDecl(n: DesignNode): string[] {
   return borderPaint(n.border, n.shadow).decls
 }
 
+/** 单元组件：顶层分区（section，页面骨架）+ 重复结构（repeat，可复用零件）统一形态 */
+interface UnitComponent {
+  name: string
+  kind: 'section' | 'repeat'
+  rootId: string
+  /** 该组件覆盖的 data-design-id 集合（对比锚点，section 优先认领，互不重叠） */
+  designIds: string[]
+  props: RepeatGroup['props']
+  /** 设计图层名（写进组件文件注释） */
+  label: string
+  count: number
+  nodeCount: number
+  rep: DesignNode
+  /** section 才有：承载的备注 id（targetId 落在该组件子树内） */
+  annotationIds: string[]
+}
+
 interface EmitCtx {
   ds: ReturnType<typeof inferDesignSystem>
   css: string[]
   jsx: string[]
   instanceTodo: string[]
   cls: (decl: string) => string
-  groupFor: (n: DesignNode) => RepeatGroup | undefined
+  boundaryFor: (n: DesignNode) => UnitComponent | undefined
   uid: () => number
 }
 
@@ -142,15 +232,17 @@ function boxDecls(n: DesignNode, parent: DesignNode | undefined, inFlow: boolean
 /** 节点 → JSX（递归；父容器是 auto-layout 时子项进 flex 流） */
 function emitNode(n: DesignNode, parent: DesignNode | undefined, indent: string, ctx: EmitCtx, index = 0): void {
   const inFlow = flowsInParent(n, parent)
-  const asGroup = ctx.groupFor(n)
-  if (asGroup) {
+  const boundary = ctx.boundaryFor(n)
+  if (boundary) {
     const decl = [...boxDecls(n, parent, inFlow), 'box-sizing: border-box']
     const c = ctx.cls(decl.join(';\n  '))
     const vals = textValuesOf(n)
-    const props = asGroup.props
+    const props = boundary.props
       .map((pr, idx) => `${pr.name}=${JSON.stringify(vals[idx] ?? pr.sample)}`)
       .join(' ')
-    ctx.jsx.push(`${indent}<div className={styles.${c}}><${asGroup.suggestedName}${props ? ` ${props}` : ''} /></div>`)
+    // section 的根节点是对比锚点，wrapper 上保留 data-design-id；repeat 维持现状（不带）
+    const anchorAttr = boundary.kind === 'section' ? ` data-design-id="${escAttr(n.id)}"` : ''
+    ctx.jsx.push(`${indent}<div className={styles.${c}}${anchorAttr}><${boundary.name}${props ? ` ${props}` : ''} /></div>`)
     return
   }
 
@@ -262,17 +354,24 @@ export function generateCode(model: DesignModel, opts: CodegenOptions): string[]
   const outDir = resolve(opts.outputDir)
   mkdirSync(join(outDir, 'src'), { recursive: true })
 
-  // ── 组件化：把"重复出现的结构"抽成可复用组件，页面只负责组合 ──
+  // ── 组件化：顶层分区（section，页面骨架）+ 重复结构（repeat，可复用零件）= 单元组件，页面只负责组合 ──
   const maxExtract = Math.max(0, Number(opts.maxExtract ?? 3))
-  const candidates = detectRepeats(model).filter((r) => r.count >= 3 && r.reusable !== false)
-  const picked: RepeatGroup[] = []
-  const pickedSigs = new Set<string>()
-  for (const c of candidates) {
-    if (picked.length >= maxExtract) break
-    if (pickedSigs.has(c.signature)) continue
-    pickedSigs.add(c.signature)
-    picked.push(c)
+  const candidateRepeats = detectRepeats(model).filter((r) => r.count >= 3 && r.reusable !== false)
+  const sections = reliableSections(model, detectSections(model))
+  const allNodes = flat([model.tree])
+
+  // 锚点归属：section 先认领（顶层分区是主拆分），repeat 后认领；同一 id 只归一个组件，杜绝跨组件重复归属。
+  const claimedIds = new Set<string>()
+  const claim = (ids: string[]): string[] => {
+    const mine: string[] = []
+    for (const id of ids) {
+      if (claimedIds.has(id)) continue
+      claimedIds.add(id)
+      mine.push(id)
+    }
+    return mine
   }
+
   const usedCompNames = new Set<string>()
   const uniqueName = (base: string): string => {
     let n = base
@@ -281,10 +380,17 @@ export function generateCode(model: DesignModel, opts: CodegenOptions): string[]
     usedCompNames.add(n)
     return n
   }
-  for (const g of picked) g.suggestedName = uniqueName(g.suggestedName)
 
-  const groupBySignature = new Map<string, RepeatGroup>()
-  for (const g of picked) groupBySignature.set(g.signature, g)
+  // 备注归属：annotation.targetId（或 variantIds）落在组件子树内 → 该组件承载
+  const annotationIdsFor = (ids: string[]): string[] => {
+    const idSet = new Set(ids)
+    return (model.annotations ?? [])
+      .filter((a) => (a.targetId ? idSet.has(a.targetId) : false)
+        || (a.variantIds ?? []).some((v) => idSet.has(v)))
+      .map((a) => String(a.id ?? a.targetId ?? ''))
+      .filter(Boolean)
+  }
+
   const signatureCache = new Map<string, string>()
   const sigOf = (n: DesignNode): string => {
     const hit = signatureCache.get(n.id)
@@ -298,7 +404,54 @@ export function generateCode(model: DesignModel, opts: CodegenOptions): string[]
     signatureCache.set(n.id, v)
     return v
   }
-  const groupFor = (n: DesignNode): RepeatGroup | undefined => groupBySignature.get(sigOf(n))
+
+  const units: UnitComponent[] = []
+
+  // ① 顶层分区作为单元组件（容器拼单元）；section 不可靠时这里为空 → 退回仅 repeat
+  for (const s of sections) {
+    const rep = allNodes.find((n) => n.id === s.id)
+    if (!rep) continue
+    const ids = claim(subtreeDesignIds(model, s.id))
+    if (!ids.length) continue
+    units.push({
+      name: uniqueName(s.suggestedName || 'Section'),
+      kind: 'section', rootId: s.id, designIds: ids,
+      props: propsForSubtree(rep), label: s.name,
+      count: 1, nodeCount: s.nodeCount, rep,
+      annotationIds: annotationIdsFor(ids),
+    })
+  }
+
+  // ② 重复结构（count≥3、maxExtract 上限）——可复用价值排序，signature 去重
+  const pickedRepeats: RepeatGroup[] = []
+  const pickedSigs = new Set<string>()
+  for (const c of candidateRepeats) {
+    if (pickedRepeats.length >= maxExtract) break
+    if (pickedSigs.has(c.signature)) continue
+    pickedSigs.add(c.signature)
+    pickedRepeats.push(c)
+  }
+  for (const g of pickedRepeats) {
+    const rep = allNodes.find((n) => n.id === g.representativeId)
+    if (!rep) continue
+    const ids = claim(subtreeDesignIds(model, g.representativeId))
+    units.push({
+      name: uniqueName(g.suggestedName),
+      kind: 'repeat', rootId: g.representativeId, designIds: ids,
+      props: g.props, label: g.name, count: g.count, nodeCount: g.nodeCount, rep,
+      annotationIds: annotationIdsFor(ids),
+    })
+  }
+
+  // 边界解析器：section 子树优先整体替换成 <Section/>，其次 repeat 子树替换成 <Repeat/>
+  const sectionByRoot = new Map<string, UnitComponent>()
+  const repeatBySig = new Map<string, UnitComponent>()
+  for (const u of units) {
+    if (u.kind === 'section') sectionByRoot.set(u.rootId, u)
+    else repeatBySig.set(sigOf(u.rep), u)
+  }
+  const boundaryFor = (n: DesignNode): UnitComponent | undefined =>
+    sectionByRoot.get(n.id) ?? repeatBySig.get(sigOf(n))
 
   // ── tokens.ts ──
   const colors = Object.entries(model.tokens.colors).map(([k, v]) => `  '${k}': '${v}',`).join('\n')
@@ -333,7 +486,7 @@ export function generateCode(model: DesignModel, opts: CodegenOptions): string[]
       cssRules.push(`.${id} {\n  ${decl}\n}`)
       return id
     },
-    groupFor,
+    boundaryFor,
     uid: () => uid++,
   }
 
@@ -348,7 +501,7 @@ export function generateCode(model: DesignModel, opts: CodegenOptions): string[]
     `import { useState } from 'react';
 import type { ${name}Props } from './types.js';
 import styles from './${name}.module.css';
-${picked.map((g) => `import { ${g.suggestedName} } from './components/${g.suggestedName}';`).join('\n')}
+${units.map((u) => `import { ${u.name} } from './components/${u.name}';`).join('\n')}
 
 /**
  * 由设计稿 ${model.nodeId} 生成的**几何骨架**。
@@ -375,14 +528,13 @@ export default ${name};
 
   writeFileSync(join(outDir, 'src', `${name}.module.css`), `${cssRules.join('\n\n')}\n`, 'utf8')
 
-  // ── 可复用组件文件：重复结构抽出来的"零件"，带 props 与类型 ──
+  // ── 单元组件文件：顶层分区（section）+ 重复结构（repeat）各出一个文件，带 props/锚点注释 ──
   const relComponents: string[] = []
-  const allNodes = flat([model.tree])
   const compRoot = join(outDir, 'src', 'components')
   const dirIndex = opts.projectLayout?.layout !== 'flat'
-  for (const g of picked) {
-    const rep = allNodes.find((n) => n.id === g.representativeId)
-    if (!rep) continue
+  const unitAnchors = new Map<string, string[]>()
+  for (const u of units) {
+    const rep = u.rep
     const styles: string[] = []
     let cuid = 0
     const cls = (decl: string): string => { const id = `c${cuid++}`; styles.push(`.${id} { ${decl} }`); return id }
@@ -392,7 +544,7 @@ export default ${name};
     for (const x of inner) {
       const rel = `position: absolute; left: ${px(x.x - rep.x)}px; top: ${px(x.y - rep.y)}px; width: ${px(x.w)}px; height: ${px(x.h)}px; box-sizing: border-box;`
       const isProp = (x.kind === 'text' && !!x.value) || (x.type === 'INSTANCE' && !!x.value)
-      const propName = isProp && propIdx < g.props.length ? g.props[propIdx].name : undefined
+      const propName = isProp && propIdx < u.props.length ? u.props[propIdx].name : undefined
       if (isProp) propIdx++
       if (x.kind === 'text') {
         const t = x.text!
@@ -410,23 +562,29 @@ export default ${name};
       const c = cls(rel + (x.background ? ` background: ${x.background};` : '') + (x.kind === 'ellipse' ? ' border-radius: 50%;' : x.radius ? ` border-radius: ${x.radius};` : ''))
       lines.push(`      <div className={styles.${c}} data-design-id="${escAttr(x.id)}" />`)
     }
-    const propsDecl = g.props.length
-      ? g.props.map((pr) => `  /** 设计文案默认值：${pr.sample} */\n  ${pr.name}?: string;`).join('\n')
-      : '  // 该组件无文案入参'
-    const defaults = g.props.map((pr) => `  ${pr.name} = ${JSON.stringify(pr.sample)},`).join('\n')
+    const propsDecl = u.props.length
+      ? u.props.map((pr) => `  /** 设计文案默认值：${pr.sample} */\n  ${pr.name}?: string;`).join('\n')
+      : '  // 该单元组件无文案入参（静态几何，文案内联；按对比锚点核对）'
+    const defaults = u.props.map((pr) => `  ${pr.name} = ${JSON.stringify(pr.sample)},`).join('\n')
+    unitAnchors.set(u.name, u.designIds)
+    const anchorLines = u.designIds.length
+      ? ` * 对比锚点（data-design-id，逐组件跑 figma_visual_diff(node_id=...) 时按此集合过滤）：\n *   ${u.designIds.join(', ')}`
+      : ' * 对比锚点：无（该结构的锚点由所属顶层分区组件覆盖）'
+    const kindLabel = u.kind === 'section' ? '顶层分区' : `重复结构，共出现 ${u.count} 次，子树 ${u.nodeCount} 节点`
     const tsx = `import type { FC } from 'react';
-import styles from './${g.suggestedName}.module.css';
+import styles from './${u.name}.module.css';
 
 /**
- * 由设计稿重复结构抽取的**可复用组件**（设计图层「${g.name}」，共出现 ${g.count} 次，子树 ${g.nodeCount} 节点）。
- * 这段几何来自设计数据；落实现时请把内部控件换成项目既有组件（见 component-plan.md 的复用清单），
- * 并保持 props 边界（数据/文案从 props 进，事件用回调出）。
+ * 由设计稿${kindLabel}抽取的**单元组件**（设计图层「${u.label}」）。
+${anchorLines}
+ * 这段几何来自设计数据；保持组件边界（不要拆散回页面），落实现时把内部控件换成项目既有组件
+ * （见 component-plan.md 的复用清单），数据/文案从 props 进、事件用回调出。
  */
-export interface ${g.suggestedName}Props {
+export interface ${u.name}Props {
 ${propsDecl}
 }
 
-export const ${g.suggestedName}: FC<${g.suggestedName}Props> = ({
+export const ${u.name}: FC<${u.name}Props> = ({
 ${defaults}
 }) => (
   <div className={styles.root}>
@@ -434,26 +592,26 @@ ${lines.join('\n') || '      {/* 该结构无可渲染子节点 */}'}
   </div>
 );
 
-export default ${g.suggestedName};
+export default ${u.name};
 `
     const cssOut = `.root { position: relative; width: 100%; height: ${px(rep.h)}px; overflow: hidden; }
 .instInput { width: 100%; height: 100%; box-sizing: border-box; border: 0; outline: 0; padding: 0 12px; background: transparent; font: inherit; color: inherit; }
 ${styles.join('\n')}
 `
-    const dir = dirIndex ? join(compRoot, g.suggestedName) : compRoot
+    const dir = dirIndex ? join(compRoot, u.name) : compRoot
     mkdirSync(dir, { recursive: true })
-    const tsxPath = dirIndex ? join(dir, 'index.tsx') : join(dir, `${g.suggestedName}.tsx`)
+    const tsxPath = dirIndex ? join(dir, 'index.tsx') : join(dir, `${u.name}.tsx`)
     writeFileSync(tsxPath, tsx, 'utf8')
-    writeFileSync(join(dir, `${g.suggestedName}.module.css`), cssOut, 'utf8')
+    writeFileSync(join(dir, `${u.name}.module.css`), cssOut, 'utf8')
     relComponents.push(tsxPath)
   }
   if (relComponents.length) {
     const barrel = join(compRoot, 'index.ts')
     if (existsSync(barrel)) {
       const cur = readFileSync(barrel, 'utf8')
-      const add = picked
-        .filter((g) => !cur.includes(`/${g.suggestedName}'`) && !cur.includes(`./${g.suggestedName}`))
-        .map((g) => `export { ${g.suggestedName} } from './${g.suggestedName}';`)
+      const add = units
+        .filter((u) => !cur.includes(`/${u.name}'`) && !cur.includes(`./${u.name}`))
+        .map((u) => `export { ${u.name} } from './${u.name}';`)
         .join('\n')
       if (add) writeFileSync(barrel, `${cur}\n${add}\n`, 'utf8')
     }
@@ -480,18 +638,38 @@ ${styles.join('\n')}
   if (opts.componentPlanMd) {
     P.push('', '## 组件化方案（复用优先 / 无则组件化 / 落点按项目实际）', '', opts.componentPlanMd.trim(), '')
   }
+  // 组件边界契约：每个单元组件的 文件 / props 契约 / data-design-id 锚点 / 承载备注 id。
+  // 空数据（无 section、无 repeat）时省略整段，不制造空契约。
+  if (units.length) {
+    P.push('', '## 组件边界契约（保持单元组件边界，逐组件跑 figma_visual_diff(node_id=...) 对比）', '')
+    P.push('主容器 `src/${name}.tsx` 只负责组合：顶层分区/重复结构已生成独立单元组件文件，主容器用 `<组件名/>` 占位。')
+    P.push('实现时**必须保持这些组件边界**（不要把某个单元组件拆散回页面里手写）；每个组件按自己的锚点逐个对比：', '')
+    P.push('| 单元组件 | 文件路径 | props 契约 | 对比锚点（data-design-id） | 承载备注 id |')
+    P.push('|---|---|---|---|---|')
+    for (const u of units) {
+      const file = `src/components/${u.name}${dirIndex ? '/index.tsx' : '.tsx'}`
+      const props = u.props.length ? u.props.map((p) => `${p.name}?: string`).join(', ') : '无（静态几何单元）'
+      const ids = u.designIds.join(', ') || '—'
+      const anns = u.annotationIds.join(', ') || '—'
+      P.push(`| ${u.name} | \`${file}\` | ${props.replace(/\|/g, '\\|')} | ${ids} | ${anns} |`)
+    }
+    P.push('')
+    P.push('逐组件对比：`figma_visual_diff(output_dir=…, impl=<你的实现页>, node_id=<该组件根 data-design-id>)`，')
+    P.push('工具会据完整设计树算出该节点的后代锚点集合，只把 spec.rows 的这一子集拿去比对——细节偏差不再淹没在整页里。')
+    P.push('node_id 支持 dash/colon 两种写法（如 `110-854` / `110:854`）；对所有单元组件逐个跑完才算完成机器回归。', '')
+  }
   if (opts.auditMd) {
     P.push('', '## 设计审计核对清单（逐项勾选；"真歧义"才需要问人，"数据缺失"按兜底规则做）', '', '```markdown', opts.auditMd.trim(), '```', '')
   }
   if (model.annotations.length) {
     P.push('', '## 设计备注 = 交互说明（必须按原文实现，不是视觉元素）', '')
     P.push('画布红字备注已从基准页移除；下面每一条都是**行为要求**。必须按下表逐条落实，单元格留空即未完成：', '')
-    P.push('| 备注 | 承载 props/state | 事件 | 文件 | 验证 |')
-    P.push('|---|---|---|---|---|')
+    P.push('| 备注 | 承载 props/state | 事件 | 真实控件/行为 | 文件 | 验证 |')
+    P.push('|---|---|---|---|---|---|')
     for (const [i, a] of model.annotations.entries()) {
       const disp = a.disposition === 'candidate' ? '候选·待确认' : '自动'
       const cell = `备注${i + 1}「${a.title}」：${a.text.replace(/\n+/g, ' / ')}（置信度 ${fmtConf(a.confidence)} · ${disp} · 信号 ${fmtSignals(a.signals)}）`
-      P.push(`| ${cell.replace(/\|/g, '\\|')} |  |  |  |  |`)
+      P.push(`| ${cell.replace(/\|/g, '\\|')} |  |  |  |  |  |`)
     }
     P.push('')
     P.push('把原文语义翻译成具体代码的示例（照着做，不是抄成注释）：')
@@ -501,6 +679,10 @@ ${styles.join('\n')}
     P.push('处置为「候选·待确认」的备注先标记待确认、不得静默丢弃，确认后再补齐上表；scope=unassigned 或无适用组件的先找人确认作用范围。')
     P.push('')
   }
+  // 需求文档里的交互点 ↔ UI 设计上的交互标注：三方对照，逐条落实，两侧都不许静默遗漏。
+  // 由独立纯函数生成，空内容时返回空串，此处跳过。
+  const crosswalk = renderRequirementsCrosswalk(opts.requirements, model.annotations)
+  if (crosswalk) P.push('', crosswalk)
   if (model.titles?.length) {
     P.push('', '## 设计标题（用于组件命名 + 可访问性标题）', '')
     P.push('下列标题来自设计数据（text/source/level/证据节点），文本是真实 UI、基准页已正常渲染。逐条对照：')
@@ -520,6 +702,26 @@ ${styles.join('\n')}
     P.push('')
   }
   P.push('', '## 逐节点规格表（id | name | type | x | y | w | h | 背景 | 描边(四边) | 虚线 | 圆角 | 字体 | 文案 | layout）', '', '```', specTable(model, 500), '```', '')
+
+  // 细节核对表：设计 literal 自动填表，data-guessed / suspects 标存疑
+  const suspects = suspectsOf(model)
+  P.push('', '## 细节核对表（机器可判定项：实测值填进「实测手段」列，超容差即返工）', '')
+  P.push('「设计值」列是 design-spec.json 的 literal（来自 model.spec / tokens），不是近似值；禁止靠肉眼或从截图取样。')
+  P.push('标「存疑·需确认，不得静默套用」的行来自 data-guessed（prov=placeholder/inferred）或设计数据存疑项，须先确认再落代码。')
+  P.push('| 属性 | 设计值 | 容差 | 实测手段 |')
+  P.push('|---|---|---|---|')
+  P.push(...detailChecklist(model))
+  P.push('')
+  if (suspects.length) {
+    P.push('', `## 设计数据存疑项 ${suspects.length} 条，逐条挂起确认`, '')
+    P.push('下列值来自推断/缺失兜底，**不得静默套用**；每条先向设计/需求确认，确认后再落代码。')
+    P.push('| 节点 | 属性 | 推断值 | 依据 | 建议动作 |')
+    P.push('|---|---|---|---|---|')
+    for (const s of suspects.slice(0, 120)) {
+      P.push(`| ${cellOf(s.nodeId ?? s.name ?? '-')} | ${cellOf(s.property ?? '-')} | ${cellOf(s.guessedValue ?? '-')} | ${cellOf(s.basis ?? '-')} | ${cellOf(s.action ?? '-')} |`)
+    }
+    P.push('', `（共 ${suspects.length} 条；同步见「细节核对表」中被标注的行。）`, '')
+  }
   if (instanceTodo.length) {
     P.push('', '## 实例与图标清单（恢复 derived 数据后仍要用项目组件/图标库替换）', '', ...instanceTodo.slice(0, 120))
   }
@@ -531,14 +733,20 @@ ${styles.join('\n')}
     '   不要自己重画控件；设计给的尺寸/逐角圆角/文案要保留；',
     '3. **保持 auto-layout 结构**：骨架已按设计稿输出 `display:flex` 或 Grid 的 `display:grid`，含两轴 gap/padding/justify/align/grow；',
     '   不要改回绝对定位，也不要把 Grid 改成 flex；只有 `stackPositioning=ABSOLUTE` 的子项才是绝对定位；',
-    '4. **色值走主题令牌**：`tokens.ts` 里是设计稿 literal 值，落项目时映射到项目主题变量；',
-    '   映射不上的列出来找设计确认（不要静默换成别的颜色）；',
+    '4. **色值策略：先查同名令牌，无同名令牌：直接写 literal**：`tokens.ts` 里是设计稿 literal 值；',
+    '   先查项目主题里有没有**同名令牌**，有就映射到该令牌；',
+    '   **无同名令牌：直接写 literal**——把设计 literal 色值原样写进样式，并加注释标注来源（如 `/* design: #666 (node 51:xx) */`）；',
+    '   不要近似替换、不要从截图取样、不要把不同色硬套同一令牌；',
     '5. **逐边描边/逐角圆角/虚线**：`border-width` 分边写；dashPattern 用 `repeating-linear-gradient` 或 SVG stroke（CSS dashed 段长不可控）；',
     '6. **图标必须使用项目/图标库的 SVG**：带 `data-icon-library` 的节点按标识精确匹配；没有标识的先确认映射。',
     '   不许按 Figma 路径自绘，也不许凭图层名猜一个相似图标；',
-    '7. 交互：受控表单、校验、按钮动作、关闭（Esc/遮罩）、可访问性；输出 `src/${name}.tsx`、`src/types.ts`、逻辑 hooks、必要测试；',
+    '7. **交互控件必须真实功能**（禁止静态假控件；逐条按 `SPEC.md` 0.1 备注映射表 / 下文 `## 设计备注 = 交互说明` 落实交互说明）：',
+    '   - 日期/时间选择器：可点击，点选后更新激活态 state（如 activeDate/selectedRange），并把选中范围绑定到组件展示；',
+    '   - 播放器：必须真实播放（`<audio>`/`<video>` 或媒体库实例），带可拖动进度条（seek），不是画一个播放三角；',
+    '   - 进度条：绑定真实进度值（state/props），随媒体 currentTime 或业务数据更新，不许写死宽度；',
+    '   受控表单、校验、按钮动作、关闭（Esc/遮罩）、可访问性照做；输出 `src/${name}.tsx`、`src/types.ts`、逻辑 hooks、必要测试；',
     '8. 类型安全、不引入第三方运行时依赖；',
-    '9. **设计备注逐条落实**：`## 设计备注 = 交互说明` 的强制映射表每行都要填满「承载 props/state | 事件 | 文件 | 验证」，空着即未完成；候选备注先标待确认、不得静默丢弃；',
+    '9. **设计备注逐条落实**：`## 设计备注 = 交互说明` 的强制映射表每行都要填满「承载 props/state | 事件 | 真实控件/行为 | 文件 | 验证」，空着即未完成；候选备注先标待确认、不得静默丢弃；',
     '   交付说明逐条回答承载字段、实现文件、验证方式。只抄成注释或静默忽略都算未完成。',
     '10. **设计标题逐条对照**：`## 设计标题` 每条用于组件/分区命名与可访问性标题（page→h1、section→h2），按证据节点核对文案与字号，不臆造、不改写、不遗漏。',
     '',
@@ -550,15 +758,18 @@ ${styles.join('\n')}
     '1. 按审计清单逐项勾选，**每项写清"在哪个文件哪一行实现的"**；',
     '2. 组件渲染截图 ↔ 基准图（static/index@2x.png）并排对照，差异逐条列出并修掉；',
     '3. 逐边描边、逐角圆角、控件高度这几类**必须用实测数值核对**（computed style），不要靠肉眼；',
-    '   可先跑 `figma_visual_diff`（逐节点 expected/actual/Δ 的机器对照），再交人看；',
-    '4. **必须过一轮 UI 专家审计**（涉及 UI 的交付一律如此）：',
+    '   **必须跑 figma_visual_diff**（逐节点 expected/actual/Δ 的机器对照），存证对照结果后再交人看；',
+    '   对已生成的单元组件（顶层分区/重复结构），要**逐个跑** `figma_visual_diff(node_id=<该组件根 data-design-id>)`，',
+    '   只比对该组件子树，避免细节偏差淹没在整页里；全部单元组件跑完才算完成机器回归；',
+    '4. **细节核对表逐项实测**：填完上文「细节核对表」实测列，色值/字号行高/gap/逐边描边/逐角圆角/文案偏差超容差即返工；',
+    '5. **必须过一轮 UI 专家审计**（涉及 UI 的交付一律如此）：',
     '   `summon_expert("UI 视觉验收设计师", 任务)` —— 任务里带设计基准图 static/index@2x.png、',
     '   设计规格 static/SPEC.md、以及你的组件截图（同尺寸/缩放），要求"逐条给出 问题/位置/期望/实际/级别"；',
     '   然后 `figma_review_to_round(output_dir, review=<专家原文>, reviewer="UI 视觉验收设计师")`；',
-    '5. 专家会产出**标注图**（问题按 id 钉在基准图上）与**打回清单**；判定为 reject 时：',
+    '6. 专家会产出**标注图**（问题按 id 钉在基准图上）与**打回清单**；判定为 reject 时：',
     '   逐条修复 → `action="close"` 关闭 → **再提审一轮拿 pass**（开发自述"改完了"不算通过）；',
-    '6. 把查到的项目既有模式沉淀成可复用事实；',
-    '7. 设计备注 + 设计标题逐条对照：备注按强制映射表填满「承载字段/事件/文件/验证」，候选（待确认）先标记再落实、不得静默丢弃；标题逐条核对命名与可访问性标题（page→h1、section→h2）及证据节点；确实无法实现的要显式说明原因，不能静默跳过。',
+    '7. 把查到的项目既有模式沉淀成可复用事实；',
+    '8. 设计备注 + 设计标题逐条对照：备注按强制映射表填满「承载 props/state | 事件 | 真实控件/行为 | 文件 | 验证」，候选（待确认）先标记再落实、不得静默丢弃；标题逐条核对命名与可访问性标题（page→h1、section→h2）及证据节点；确实无法实现的要显式说明原因，不能静默跳过。',
   )
   writeFileSync(join(outDir, 'CODEGEN_PROMPT.md'), P.join('\n'), 'utf8')
 
@@ -571,8 +782,10 @@ ${styles.join('\n')}
 - 视觉基准：\`SPEC.md\`（规格 + 台账 + 映射表）与静态还原页（由 \`figma_render_static\` 产出）
 - 布局：按设计稿 auto-layout 生成 flex；\`abs.html\` 为绝对定位对照
 - 设计令牌：\`src/tokens.ts\`（设计 literal 值，落项目要映射主题令牌）
-- 几何骨架：\`src/${name}.tsx\` + \`src/${name}.module.css\`
-- 补全指引：\`CODEGEN_PROMPT.md\`
+- 几何骨架：\`src/${name}.tsx\` + \`src/${name}.module.css\`（主容器只负责组合单元组件）
+- 单元组件：\`src/components/\`（顶层分区 + 重复结构各出一个文件；文件头注释写了各自的 data-design-id 对比锚点）
+- 逐组件对比：对每个单元组件跑 \`figma_visual_diff(output_dir=…, impl=<实现页>, node_id=<该组件根 data-design-id>)\`，只比对该组件子树，避免细节偏差淹没在整页里；node_id 支持 dash/colon 两种写法
+- 补全指引：\`CODEGEN_PROMPT.md\`（见「组件边界契约」段）
 `,
     'utf8',
   )

@@ -91,6 +91,41 @@ const num = (v: unknown): number => {
   return Number.isFinite(n) ? n : 0
 }
 
+/** 设计树的最小形状（DesignNode 结构上满足：id + 可选 children/raw.visible） */
+export interface TreeLikeNode {
+  id: string
+  children?: TreeLikeNode[]
+  raw?: { visible?: boolean }
+}
+
+/**
+ * 从完整设计树里取某个节点的后代 data-design-id 集合（含自身）。
+ *  - 找不到节点 → 返回 null（调用方必须抛明确错误，绝不静默退化成整页对比）
+ *  - 跳过 raw.visible === false 的子树，与骨架/基准页口径一致
+ *  - 去重且保持树序
+ */
+export function descendantDesignIds(tree: TreeLikeNode | undefined, nodeId: string): string[] | null {
+  if (!tree) return null
+  const find = (n: TreeLikeNode): TreeLikeNode | undefined => {
+    if (String(n.id) === nodeId) return n
+    for (const c of n.children ?? []) {
+      const hit = find(c)
+      if (hit) return hit
+    }
+    return undefined
+  }
+  const target = find(tree)
+  if (!target) return null
+  const ids: string[] = []
+  const walk = (n: TreeLikeNode): void => {
+    if (n.raw?.visible === false) return
+    ids.push(String(n.id))
+    for (const c of n.children ?? []) walk(c)
+  }
+  walk(target)
+  return [...new Set(ids)]
+}
+
 /** `rgb(1, 2, 3)` / `rgba(1,2,3,0.5)` → `#010203`（alpha 单独比） */
 function rgbToHexColor(s: string): string | undefined {
   const m = /rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i.exec(String(s ?? ''))
@@ -376,6 +411,8 @@ export interface VisualDiffResult {
   findings: VisualFinding[]
   checked: number
   missing: string[]
+  /** findings=0 且没有实现页缺失节点（= 没有未接受的差异）；收尾门禁据此放行 */
+  clean: boolean
   reportPath?: string
   jsonPath?: string
   error?: string
@@ -384,14 +421,16 @@ export interface VisualDiffResult {
 /** 一站式：跑探针 → 对照 → 落盘报告 */
 export async function visualDiff(opts: VisualDiffOptions & { rows: SpecRowLite[] }): Promise<VisualDiffResult> {
   const probe = await runProbe(opts)
-  if (!probe.ok) return { ok: false, findings: [], checked: 0, missing: [], error: probe.error }
+  if (!probe.ok) return { ok: false, findings: [], checked: 0, missing: [], clean: false, error: probe.error }
   const { findings, checked, missing } = compareProbe(
     opts.rows, probe.nodes, opts.tolerance ?? 1.5,
     probe.root, { width: opts.width, height: opts.height },
   )
+  // 干净 = 没有任何差异、也没有缺失节点（缺失节点本身也会进 findings，这里再显式卡一道）。
+  const clean = findings.length === 0 && missing.length === 0
   mkdirSync(opts.outDir, { recursive: true })
   const jsonPath = join(opts.outDir, 'visual-diff.json')
-  writeFileSync(jsonPath, JSON.stringify({ checked, findings, missing }, null, 2), 'utf8')
+  writeFileSync(jsonPath, JSON.stringify({ checked, findings, missing, clean }, null, 2), 'utf8')
   const md: string[] = []
   md.push('# 自动视觉回归（实现 vs 设计规格）', '')
   md.push(`- 对照节点：${checked} · 差异：${findings.length} · 实现页缺失节点：${missing.length}`)
@@ -412,5 +451,5 @@ export async function visualDiff(opts: VisualDiffOptions & { rows: SpecRowLite[]
   }
   const reportPath = join(opts.outDir, 'visual-diff.md')
   writeFileSync(reportPath, md.join('\n'), 'utf8')
-  return { ok: true, findings, checked, missing, reportPath, jsonPath }
+  return { ok: true, findings, checked, missing, clean, reportPath, jsonPath }
 }

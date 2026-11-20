@@ -31,6 +31,21 @@ const js = ts.transpileModule(src, {
 const design = await import('data:text/javascript;base64,' + Buffer.from(js).toString('base64'))
 const { buildDesignModel, extractAnnotations, extractTitles, paintToCss, instanceTextPartsOf } = design
 
+// audit.ts 依赖链（audit.ts -> icons.ts -> design.ts）逐层转译成 data URL，保证测的是本席位改的源码
+const toUrl = (code) => 'data:text/javascript;base64,' + Buffer.from(code).toString('base64')
+const transpile = (name, overrides = {}) => {
+  let s = readFileSync(resolve(ROOT, 'src', name), 'utf8')
+  for (const [from, target] of Object.entries(overrides)) s = s.replaceAll(`from '${from}'`, `from '${target}'`)
+  return ts.transpileModule(s, {
+    fileName: name,
+    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+  }).outputText
+}
+const designUrl = toUrl(transpile('design.ts'))
+const iconsUrl = toUrl(transpile('icons.ts', { './design.js': designUrl }))
+const auditUrl = toUrl(transpile('audit.ts', { './design.js': designUrl, './icons.js': iconsUrl }))
+const { auditModel } = await import(auditUrl)
+
 function loadFixture(name) {
   return JSON.parse(readFileSync(resolve(FIXTURES, name + '.ws.json'), 'utf8'))
 }
@@ -226,3 +241,140 @@ if (e2ePath) {
     assert.equal(m.annotations.length, 2, '真实样本应恰好识别 2 条备注（无 UI 文案误报）')
   })
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// 实现项③：设计数据缺失「显式存疑」+ 精确颜色（新增用例）
+// ═══════════════════════════════════════════════════════════════════════
+
+/** 合成最小 nodeJson：root FRAME + 若干 descendant（可含 INSTANCE / 文本色 / 边框色 / 背景色） */
+function synth(descendants, nodeExtra = {}) {
+  return {
+    fileKey: 'T', nodeId: '1:1',
+    node: {
+      guid: { sessionID: 1, localID: 1 }, type: 'FRAME', name: 'Root', visible: true,
+      transform: { m00: 1, m01: 0, m02: 0, m10: 0, m11: 1, m12: 0 }, size: { x: 300, y: 200 },
+      fillPaintCollector: undefined,
+      ...nodeExtra,
+    },
+    descendants,
+  }
+}
+const desc = (localID, extra = {}) => ({
+  guid: { sessionID: 1, localID },
+  parentIndex: { guid: { sessionID: 1, localID: 1 } },
+  type: 'FRAME', name: `N${localID}`, visible: true,
+  transform: { m00: 1, m01: 0, m02: 0, m10: 0, m11: 1, m12: 0 }, size: { x: 40, y: 20 },
+  ...extra,
+})
+const solidFill = (r, g, b) => [{ type: 'SOLID', color: { r, g, b, a: 1 }, opacity: 1, visible: true }]
+
+// ── 边界：无 suspects 设计 → suspects=[] 且 audit 不增「存疑·需确认」条目 ──
+test('存疑边界：空设计 suspects=[]，colorSources 可溯源，audit 不增存疑条目', () => {
+  const m = model('empty')
+  assert.deepEqual(m.suspects, [], '空设计（无实例缺口）应 suspects=[]')
+  assert.ok(m.colorSources && typeof m.colorSources === 'object', 'colorSources 应为对象')
+  assert.equal(m.colorSources['#ffffff'], '51:1', '白色应溯源到根节点 51:1')
+  const a = auditModel(m)
+  assert.equal(a.missing.filter((x) => x.includes('存疑·需确认')).length, 0, '无 suspects 时 audit 不应新增存疑条目')
+})
+
+// ── SuspectItem 契约：字段齐全且 basis 为四类之一 ──
+test('SuspectItem 契约：字段齐全，basis ∈ 四类', () => {
+  const m = buildDesignModel(synth([desc(2, { type: 'INSTANCE', name: 'Input' })]))
+  assert.ok(m.suspects.length > 0)
+  const allowed = new Set(['tally-inferred', 'instance-missing', 'no-paint', 'default'])
+  for (const s of m.suspects) {
+    for (const k of ['nodeId', 'name', 'property', 'guessedValue', 'basis', 'evidence', 'action']) {
+      assert.ok(k in s, `suspect 缺字段 ${k}`)
+      assert.equal(typeof s[k], 'string', `suspect.${k} 应为 string`)
+    }
+    assert.ok(allowed.has(s.basis), `未知 basis ${s.basis}`)
+  }
+})
+
+// ── no-paint / instance-missing / tally / default 四分类 ──
+test('存疑分类：no-paint（实例无 fillPaints）', () => {
+  const m = buildDesignModel(synth([desc(2, { type: 'INSTANCE', name: 'Input' })]))
+  const s = m.suspects.find((x) => x.basis === 'no-paint')
+  assert.ok(s, '应产出 no-paint suspect')
+  assert.equal(s.property, 'fill')
+  assert.equal(s.nodeId, '1:2')
+  assert.ok(s.evidence.includes('fillPaints'), 'evidence 应指向 fillPaints 数据路径')
+  assert.ok(s.action.length > 0)
+})
+
+test('存疑分类：instance-missing（derived 有度量无前景色）', () => {
+  const inst = desc(2, {
+    type: 'INSTANCE', name: 'Text Button', fillPaints: solidFill(0.1, 0.1, 0.1),
+    symbolData: { symbolOverrides: [{ guidPath: { guids: [{ sessionID: 9, localID: 1 }] }, textData: { characters: 'OK' } }] },
+    derivedSymbolData: [{ guidPath: { guids: [{ sessionID: 9, localID: 1 }] },
+      derivedTextData: { glyphs: [{ fontSize: 14 }], fontMetaData: [{ key: { family: 'Inter', fontWeight: 400 } }], layoutSize: { x: 20, y: 16 } },
+      transform: { m02: 4, m12: 4 }, size: { x: 20, y: 16 } }],
+  })
+  const m = buildDesignModel(synth([inst]))
+  const s = m.suspects.find((x) => x.basis === 'instance-missing')
+  assert.ok(s, '应产出 instance-missing suspect')
+  assert.equal(s.property, 'text-color')
+  assert.ok(s.evidence.includes('derivedSymbolData'), 'evidence 应指向 derived 数据路径')
+})
+
+test('存疑分类：default（无众数数据时回落字面量 #dee0ec 等）', () => {
+  const m = buildDesignModel(synth([desc(2, { type: 'INSTANCE', name: 'Input' })]))
+  const defs = m.suspects.filter((x) => x.basis === 'default')
+  assert.ok(defs.length > 0, '应产出 default suspect')
+  assert.ok(defs.some((x) => x.property === 'stroke' && x.guessedValue === '#dee0ec'), 'line 应回落 #dee0ec')
+  assert.ok(defs.some((x) => x.property === 'text-color' && x.guessedValue === '#1c2433'), 'text 应回落 #1c2433')
+})
+
+test('存疑分类：tally-inferred（众数推色来自真实节点，evidence 可溯源）', () => {
+  const m = buildDesignModel(synth([
+    desc(2, { type: 'INSTANCE', name: 'Input' }),
+    desc(3, { name: 'Chip', fillPaints: solidFill(0.4, 0.5, 0.9) }),
+  ]))
+  const tal = m.suspects.filter((x) => x.basis === 'tally-inferred')
+  assert.ok(tal.length > 0, '应产出 tally-inferred suspect')
+  const chip = tal.find((x) => x.guessedValue === '#6680e6')
+  assert.ok(chip, '众数色应来自 Chip 背景 #6680e6')
+  assert.ok(chip.evidence.includes('descendants[1].fillPaints[0].color'), 'evidence 应含真实数据路径')
+  assert.equal(chip.nodeId, '1:3', '应溯源到 Chip 节点')
+})
+
+// ── 精确颜色：colorSources 每个颜色都能追溯到 node id ──
+test('精确颜色：colorSources 覆盖 tokens.colors 且指向真实节点', () => {
+  const m = buildDesignModel(synth([
+    desc(2, { name: 'A', fillPaints: solidFill(0.4, 0.5, 0.9) }),
+    desc(3, { name: 'B', fillPaints: solidFill(0.1, 0.2, 0.3) }),
+  ]))
+  for (const color of Object.keys(m.tokens.colors)) {
+    assert.ok(color in m.colorSources, `tokens.colors 的 ${color} 应在 colorSources 有溯源`)
+    assert.ok(m.colorSources[color], `${color} 的溯源 nodeId 不应为空`)
+  }
+  assert.equal(m.colorSources['#6680e6'], '1:2')
+  assert.equal(m.colorSources['#1a334d'], '1:3')
+})
+
+// ── audit：tally/default suspect 进 missing，标「存疑·需确认」 ──
+test('audit：tally/default suspect 进 missing 并标存疑·需确认', () => {
+  const m = buildDesignModel(synth([desc(2, { type: 'INSTANCE', name: 'Input' })]))
+  const a = auditModel(m)
+  const doubts = a.missing.filter((x) => x.includes('存疑·需确认'))
+  assert.ok(doubts.length > 0, 'audit.missing 应有存疑条目')
+  assert.ok(doubts.some((x) => x.includes('#dee0ec')), '应含 default 推断色 #dee0ec')
+  // no-paint / instance-missing 的 basis 不进 missing（只有 tally/default 进）
+  assert.ok(!doubts.some((x) => x.includes('no-paint') || x.includes('instance-missing')),
+    '只有 tally-inferred/default 进 missing，no-paint/instance-missing 不进')
+})
+
+// ── 回归：b1a6297 备注/标题 audit 逻辑不回退 ──
+test('回归：b1a6297 备注/标题 audit 逻辑不回退', () => {
+  const m = model('notes-no-keyword')
+  const a = auditModel(m)
+  assert.equal(m.annotations.length, 2, '备注仍应识别 2 条')
+  assert.ok(a.checklist.some((x) => x.includes('【设计备注')), 'audit.checklist 仍含设计备注条目')
+  const m2 = model('title-prominent')
+  assert.ok(m2.titles.some((t) => t.source === 'prominentText'), '标题仍应识别 prominentText')
+  assert.ok(auditModel(m2).checklist.some((x) => x.includes('【设计标题')), 'audit.checklist 仍含设计标题条目')
+  // 候选备注仍进 ambiguous，未归属备注仍进 missing（保留原逻辑）
+  const m3 = model('candidate-note')
+  assert.ok(auditModel(m3).ambiguous.some((x) => x.includes('设计备注候选')), '候选备注仍进 ambiguous')
+})

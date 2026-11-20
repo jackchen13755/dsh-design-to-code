@@ -21,9 +21,9 @@
  */
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import type { CoverageReport, DesignModel, DesignNode, DesignSpecRow } from './design.js'
+import type { CoverageReport, DesignModel, DesignNode, DesignSpecRow, SuspectItem } from './design.js'
 import { flatten } from './design.js'
-import { borderPaint, contentInsets, flexDecls, flowChildDecls, flowsInParent, orderFlow, radiusDecl, rootCssDecls, verifyFlexPlan } from './layout.js'
+import { borderPaint, contentInsets, flexDecls, flowChildDecls, flowsInParent, orderFlow, radiusDecl, rootCssDecls, verifyFlexPlan, type FlexMismatch } from './layout.js'
 import { iconRefOf } from './icons.js'
 
 export interface StaticRenderOptions {
@@ -46,6 +46,10 @@ export interface StaticRenderResult {
   specJsonPath: string
   coveragePath: string
   layoutReportPath: string
+  /** 几何真值清单：mismatch 节点的 flex 推断值 / 设计坐标 / 采用值（见 SPEC 0.3） */
+  geometryTruthPath: string
+  /** abs.html 对应的 2x 图路径（真几何，供 UI 专家看；由工具层的导出流程落盘） */
+  absPngPath: string
   stats: { nodes: number; rules: number; instances: number; flexContainers: number; flexMismatches: number; borderFallbacks: number }
 }
 
@@ -418,7 +422,7 @@ window.addEventListener('load', function () {
 }
 
 /** 生成 SPEC.md：设计规格 + 到项目 token 的映射表（右列由人/会话填） */
-export function renderSpecMarkdown(model: DesignModel, ds: Ds, projectName?: string, iconAssets: Record<string, string> = {}): string {
+export function renderSpecMarkdown(model: DesignModel, ds: Ds, projectName?: string, iconAssets: Record<string, string> = {}, mismatches: FlexMismatch[] = []): string {
   const L: string[] = []
   const cov = model.coverage
   L.push(`# 设计规格与映射表：${model.componentName}（${model.fileKey} · ${model.nodeId}）`)
@@ -480,6 +484,54 @@ export function renderSpecMarkdown(model: DesignModel, ds: Ds, projectName?: str
     })
     L.push('')
   }
+  // 0.3 几何可信度：flex 推断坐标与设计坐标不一致的节点，逐条列 + 采用值。
+  // 无 mismatch 时整段省略（不要输出一张空表误导读者）。
+  if (mismatches.length) {
+    L.push('## 0.3 基准页几何可信度（flex 推断 vs 设计坐标）')
+    L.push('')
+    L.push('下列节点按 auto-layout 推出的 flex 坐标**无法复现设计坐标**；基准页已强制回设计坐标（spec x/y/w/h），元素带 `data-inferred-geometry="1"`，机器可读清单见 `geometry-truth.json`（chosen=design）。实现时以设计坐标为准，不要拿 flex 推断值当"设计意图"。')
+    L.push('')
+    L.push('| # | 节点 ID | 图层 | 父容器 | flex 推断 (x,y,w,h) | 设计坐标 (x,y,w,h) | 采用 |')
+    L.push('|---|---|---|---|---|---|---|')
+    mismatches.forEach((m, i) => {
+      const f = m.actual
+      const d = m.expected
+      L.push(`| ${i + 1} | ${esc(m.id)} | ${esc(m.name).replace(/\|/g, '\\|')} | ${esc(m.containerId)} | ${f.x},${f.y},${f.w},${f.h} | ${d.x},${d.y},${d.w},${d.h} | design |`)
+    })
+    L.push('')
+  }
+
+  // 0.4 存疑清单：来自 design.ts 的显式 suspects（C1，只读消费）。
+  const suspects: SuspectItem[] = model.suspects ?? []
+  if (suspects.length) {
+    L.push('## 0.4 存疑清单（数据缺失/众数推断/默认兜底猜出来的值，需人工确认）')
+    L.push('')
+    L.push('这些属性的值**不是设计原值**，是解码数据缺失后按规律猜出来的；实现时必须逐条确认，不得静默采纳。')
+    L.push('')
+    L.push('| # | 节点 ID | 图层 | 属性 | 猜测值 | 依据 | 证据 | 建议动作 |')
+    L.push('|---|---|---|---|---|---|---|---|')
+    suspects.forEach((s, i) => {
+      const cell = (v: unknown): string => esc(String(v ?? '')).replace(/\|/g, '\\|')
+      L.push(`| ${i + 1} | ${cell(s.nodeId)} | ${cell(s.name)} | ${cell(s.property)} | ${cell(s.guessedValue)} | ${cell(s.basis)} | ${cell(s.evidence)} | ${cell(s.action)} |`)
+    })
+    L.push('')
+  }
+
+  // 0.5 精确颜色清单：tokens.colors 的每个 literal + 来源节点 id（C-extension colorSources）。
+  const colorEntries = Object.entries(model.tokens.colors ?? {})
+  const colorSources = model.colorSources ?? {}
+  if (colorEntries.length) {
+    L.push('## 0.5 精确颜色清单（设计 literal 值 + 来源节点，取样请取来源节点而非抗锯齿后的像素）')
+    L.push('')
+    L.push('| # | 颜色 literal | 来源节点 ID |')
+    L.push('|---|---|---|')
+    colorEntries.forEach(([key, value], i) => {
+      const src = colorSources[value] ?? colorSources[key] ?? '-'
+      L.push(`| ${i + 1} | \`${esc(value)}\` | ${esc(src)} |`)
+    })
+    L.push('')
+  }
+
   L.push('## 1. 静态还原页不是"要搬进项目的样式"')
   L.push('')
   L.push('`index.html` 是**视觉基准**：按 auto-layout 出 flex + 设计稿 literal 色值，只回答"设计长什么样"。')
@@ -611,19 +663,48 @@ export function renderStatic(model: DesignModel, opts: StaticRenderOptions): Sta
   }
   markJoinedRoles([model.tree])
 
+  // ── 坐标失真治理：先算 mismatch，再据此生成 index.html 的强制归位覆盖 ──
+  // verifyFlexPlan 只检查 flex 流内子项；mismatch.expected=设计坐标、actual=flex 推断值。
+  const plan = verifyFlexPlan(model)
+  const mismatches = plan.mismatches
+  const mismatchIds = new Set(mismatches.map((m) => m.id))
+  const specById = new Map(model.spec.map((r) => [r.id, r]))
+  /** 设计真值：优先取 spec 行（x/y/w/h 已是归零后的设计坐标），缺失才回落到 flex plan 的 expected。 */
+  const truthOf = (m: FlexMismatch): { x: number; y: number; w: number; h: number } => {
+    const r = specById.get(m.id)
+    return r ? { x: r.x, y: r.y, w: r.w, h: r.h } : m.expected
+  }
+  // 绝对定位覆盖 CSS：用 spec 设计坐标强制归位，!important 压过渲染器生成的 class。
+  // 选择器同时要求 data-inferred-geometry="1"，保证"有标记才被覆盖"，便于审计与回退。
+  const forceCss = mismatches.length
+    ? `/* 坐标失真治理：mismatch 节点强制回设计坐标（spec x/y/w/h），逐条见 geometry-truth.json */\n` +
+      mismatches.map((m) => {
+        const t = truthOf(m)
+        const sel = `[data-inferred-geometry="1"][data-design-id="${String(m.id).replace(/"/g, '\\"')}"]`
+        return `${sel}{position:absolute!important;left:${px(t.x)}px!important;top:${px(t.y)}px!important;width:${px(t.w)}px!important;height:${px(t.h)}px!important}`
+      }).join('\n')
+    : ''
+  const forceHud = mismatches.length
+    ? `<br><b style="color:#ffd479">⚠ ${mismatches.length} 个节点几何已按设计坐标强制归位</b>（data-inferred-geometry="1" · 逐条见 geometry-truth.json / SPEC 0.3 · index@2x.png 即按设计坐标归位后的真几何对照）`
+    : ''
+
   // ── 页 A：按 auto-layout 出 flex（视觉基准） ──
   const a = makeCtx()
   const topKids = model.tree.layout?.mode ? orderFlow(model.tree.children.filter((c) => c.raw.visible !== false), model.tree) : model.tree.children
-  const bodyFlex = topKids.map((c, i) => renderChild(c, a.ctx, model.tree, 'relative', true, i)).join('\n')
+  const bodyFlexRaw = topKids.map((c, i) => renderChild(c, a.ctx, model.tree, 'relative', true, i)).join('\n')
+  // 给 mismatch 节点打标记：只在带 data-design-id 的渲染元素上追加属性，不碰 title 里的纯文本 id。
+  const bodyFlex = mismatchIds.size
+    ? bodyFlexRaw.replace(/data-design-id="([^"]*)"/g, (full, id: string) => mismatchIds.has(id) ? `${full} data-inferred-geometry="1"` : full)
+    : bodyFlexRaw
   const frameStyle = rootDecls(model).join(';')
   const title = opts.title ?? model.componentName
   const fonts = model.coverage.fonts
   const html = pageShell({
     title: `设计稿静态还原 ${model.nodeId} · ${esc(title)}`,
-    model, frameStyle, body: bodyFlex, css: a.css.join('\n'), fonts,
+    model, frameStyle, body: bodyFlex, css: [a.css.join('\n'), forceCss].filter(Boolean).join('\n'), fonts,
     hud: `<b>设计稿静态还原（视觉基准）</b> · ${esc(title)}（${model.width}×${model.height}）<br>
   逐节点来自设计数据：auto-layout→flex · 逐边描边（含虚线）· 逐角圆角 · 字体 · 容器裁剪 · 根节点绘制<br>
-  带 <b>data-guessed</b> 的元素是按设计系统常量推断的；悬停可看<b>节点 ID + 图层名</b>（见 SPEC.md 第 0 节）`,
+  带 <b>data-guessed</b> 的元素是按设计系统常量推断的；悬停可看<b>节点 ID + 图层名</b>（见 SPEC.md 第 0 节）${forceHud}`,
   })
 
   // ── 页 B：全绝对定位对照（旧行为，用于归因） ──
@@ -643,8 +724,7 @@ export function renderStatic(model: DesignModel, opts: StaticRenderOptions): Sta
   writeFileSync(htmlPath, html, 'utf8')
   writeFileSync(absHtmlPath, htmlAbs, 'utf8')
 
-  // ── 机器可读：规格 + 台账 + flex 推演结果 ──
-  const plan = verifyFlexPlan(model)
+  // ── 机器可读：规格 + 台账 + flex 推演结果 + 几何真值 ──
   writeFileSync(join(outDir, 'spec.json'), JSON.stringify({
     nodeId: model.nodeId, fileKey: model.fileKey,
     width: model.width, height: model.height,
@@ -668,16 +748,34 @@ export function renderStatic(model: DesignModel, opts: StaticRenderOptions): Sta
     mismatches: plan.mismatches,
   }, null, 2), 'utf8')
 
+  // C3 几何真值清单：mismatch 节点的 flex 推断 / 设计坐标 / 采用值。
+  // 元素已注入 data-inferred-geometry="1" + 绝对定位覆盖，所以 chosen 恒为 design。
+  const geometryTruthPath = join(outDir, 'geometry-truth.json')
+  const geometryTruth = mismatches.map((m) => {
+    const t = truthOf(m)
+    return {
+      nodeId: m.id,
+      flexInferred: { x: m.actual.x, y: m.actual.y, w: m.actual.w, h: m.actual.h },
+      designTruth: { x: t.x, y: t.y, w: t.w, h: t.h },
+      chosen: 'design' as const,
+    }
+  })
+  writeFileSync(geometryTruthPath, JSON.stringify(geometryTruth, null, 2), 'utf8')
+
+  // abs@2x.png 的落点路径（与 screenshot.ts 的 pngPathsFor 约定一致：abs.html → abs@2x.png）。
+  // 真正的 PNG 字节由工具层的 exportStaticPagePng 对 absHtmlPath 渲染落盘（renderStatic 保持同步）。
+  const absPngPath = absHtmlPath.replace(/\.html?$/i, '') + '@2x.png'
+
   let specPath: string | undefined
   if (opts.spec !== false) {
     specPath = join(outDir, 'SPEC.md')
-    writeFileSync(specPath, renderSpecMarkdown(model, ds, opts.projectName, opts.iconAssets), 'utf8')
+    writeFileSync(specPath, renderSpecMarkdown(model, ds, opts.projectName, opts.iconAssets, mismatches), 'utf8')
   }
 
   return {
     htmlPath, absHtmlPath, specPath,
     specJsonPath: join(outDir, 'spec.json'),
-    coveragePath, layoutReportPath,
+    coveragePath, layoutReportPath, geometryTruthPath, absPngPath,
     stats: {
       nodes: nodes.length, rules: a.css.length + b.css.length, instances,
       flexContainers: plan.containers, flexMismatches: plan.mismatches.length,

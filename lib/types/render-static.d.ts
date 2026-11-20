@@ -1,4 +1,5 @@
 import type { CoverageReport, DesignModel, DesignNode } from './design.js';
+import { type FlexMismatch } from './layout.js';
 export interface StaticRenderOptions {
     outputDir: string;
     /** 组件/页面名（用于标题） */
@@ -18,6 +19,10 @@ export interface StaticRenderResult {
     specJsonPath: string;
     coveragePath: string;
     layoutReportPath: string;
+    /** 几何真值清单：mismatch 节点的 flex 推断值 / 设计坐标 / 采用值（见 SPEC 0.3） */
+    geometryTruthPath: string;
+    /** abs.html 对应的 2x 图路径（真几何，供 UI 专家看；由工具层的导出流程落盘） */
+    absPngPath: string;
     stats: {
         nodes: number;
         rules: number;
@@ -51,7 +56,7 @@ export declare function joinRoleOf(n: DesignNode): JoinRole | undefined;
 /** 从设计数据里"投票"出设计系统常量，避免把某个项目的色值写死在插件里 */
 export declare function inferDesignSystem(model: DesignModel): Ds;
 /** 生成 SPEC.md：设计规格 + 到项目 token 的映射表（右列由人/会话填） */
-export declare function renderSpecMarkdown(model: DesignModel, ds: Ds, projectName?: string, iconAssets?: Record<string, string>): string;
+export declare function renderSpecMarkdown(model: DesignModel, ds: Ds, projectName?: string, iconAssets?: Record<string, string>, mismatches?: FlexMismatch[]): string;
 export declare function renderStatic(model: DesignModel, opts: StaticRenderOptions): StaticRenderResult;
 /** 供 codegen 复用的摘要行（把规格表塞进 Codegen Prompt） */
 export declare function specTable(model: DesignModel, limit?: number): string;

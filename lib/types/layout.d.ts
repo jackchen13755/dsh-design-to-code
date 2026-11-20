@@ -26,6 +26,12 @@ export interface FlexMismatch {
     actual: Box;
     delta: [number, number, number, number];
 }
+/** verifyFlexPlan 返回形状（导出供渲染层直接消费 mismatches，避免重复推算） */
+export type FlexPlan = {
+    containers: number;
+    flowChildren: number;
+    mismatches: FlexMismatch[];
+};
 export declare const isHorizontal: (mode?: string) => boolean;
 export declare const isGrid: (mode?: string) => boolean;
 interface Track extends DesignGridTrack {
@@ -63,11 +69,7 @@ export declare function flowChildDecls(child: DesignNode, parent: DesignNode, in
  * 按 flex 规则推演子项位置，与设计坐标比对。
  * 只检查"在流里"的子项；绝对子项按 left/top 天然一致，不参与。
  */
-export declare function verifyFlexPlan(model: DesignModel, tol?: number): {
-    containers: number;
-    flowChildren: number;
-    mismatches: FlexMismatch[];
-};
+export declare function verifyFlexPlan(model: DesignModel, tol?: number): FlexPlan;
 /**
  * 描边的**非布局**画法（关键修复）。
  *

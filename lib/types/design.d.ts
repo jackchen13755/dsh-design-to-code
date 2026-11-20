@@ -264,6 +264,20 @@ export interface DesignTitle {
     confidence: number;
     signals: AnnotationSignal[];
 }
+/**
+ * 显式存疑项：设计数据缺失 / 众数推断 / 默认值兜底导致的「猜出来」的属性。
+ * SPEC/Prompt 必须逐条列出，不静默当已确认。
+ * property 取值如 'fill' | 'text-color' | 'stroke' | 'font' | 'size' | 'radius' | 'gap'。
+ */
+export interface SuspectItem {
+    nodeId: string;
+    name: string;
+    property: string;
+    guessedValue: string;
+    basis: 'tally-inferred' | 'instance-missing' | 'no-paint' | 'default';
+    evidence: string;
+    action: string;
+}
 export interface DesignModel {
     fileKey: string;
     nodeId: string;
@@ -289,6 +303,17 @@ export interface DesignModel {
     annotations: DesignAnnotation[];
     /** 推断出的页面/组件标题（显著文本 / 语义帧名 / 备注标题） */
     titles: DesignTitle[];
+    /**
+     * 显式存疑清单：值由数据缺失 / 众数推断 / 默认兜底猜出来，非设计原值。
+     * 供 SPEC / Prompt / audit 显式列出，避免"静默猜色"返工。
+     */
+    suspects: SuspectItem[];
+    /**
+     * 精确颜色溯源：token 颜色值 → 来源节点 id（与 tokens.colors 并行，不改动其形状）。
+     * W2 的精确颜色清单据此定位应取样的节点，避免抗锯齿取样得到错误色值。
+     * 同一色值被多节点使用时取最先出现者（walk 顺序确定，结果稳定）。
+     */
+    colorSources: Record<string, string>;
 }
 export interface CoverageReport {
     /** 总节点数（不含隐藏） */

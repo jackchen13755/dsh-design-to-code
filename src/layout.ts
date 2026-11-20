@@ -29,6 +29,9 @@ export interface FlexMismatch {
   delta: [number, number, number, number]
 }
 
+/** verifyFlexPlan 返回形状（导出供渲染层直接消费 mismatches，避免重复推算） */
+export type FlexPlan = { containers: number; flowChildren: number; mismatches: FlexMismatch[] }
+
 const JUSTIFY: Record<string, string> = {
   MIN: 'flex-start',
   CENTER: 'center',
@@ -201,11 +204,7 @@ function mainSizeForGrid(child: DesignNode, track: number | undefined): number {
  * 按 flex 规则推演子项位置，与设计坐标比对。
  * 只检查"在流里"的子项；绝对子项按 left/top 天然一致，不参与。
  */
-export function verifyFlexPlan(model: DesignModel, tol = 1): {
-  containers: number
-  flowChildren: number
-  mismatches: FlexMismatch[]
-} {
+export function verifyFlexPlan(model: DesignModel, tol = 1): FlexPlan {
   const mismatches: FlexMismatch[] = []
   let containers = 0
   let flowChildren = 0

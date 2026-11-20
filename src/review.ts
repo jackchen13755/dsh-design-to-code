@@ -73,10 +73,14 @@ export interface KnownDiff {
   at?: string
 }
 
+/**
+ * 严重级关键词（含 UI 专家常用的 emoji / 方括号前缀 / "级别:major" 写法）。
+ * 顺序：blocker → major → minor；先匹配到的算数。
+ */
 const SEVERITY_RULES: Array<[RegExp, ReviewSeverity]> = [
-  [/阻断|严重|致命|blocker|critical|must.?fix|p0/i, 'blocker'],
-  [/主要|重要|不满足|不符合|错误|major|should.?fix|p1/i, 'major'],
-  [/次要|建议|优化|polish|minor|nice.?to.?have|p2|nit/i, 'minor'],
+  [/🔴|\[\s*blocker\s*\]|级别\s*[:：]\s*blocker|阻断|严重|致命|blocker|critical|must.?fix|p0/i, 'blocker'],
+  [/🟠|\[\s*major\s*\]|级别\s*[:：]\s*major|主要|重要|不满足|不符合|错误|major|should.?fix|p1/i, 'major'],
+  [/🟡|\[\s*minor\s*\]|级别\s*[:：]\s*minor|次要|建议|优化|polish|minor|nice.?to.?have|p2|nit/i, 'minor'],
 ]
 
 function severityOf(line: string): { severity: ReviewSeverity; source: 'text' | 'default' } {
@@ -88,9 +92,9 @@ function severityOf(line: string): { severity: ReviewSeverity; source: 'text' | 
 function severityFromCell(cell: string): ReviewSeverity | undefined {
   const c = String(cell ?? '').trim().toLowerCase().replace(/[\s_-]/g, '')
   if (!c) return undefined
-  if (/^(blocker|阻断|严重|致命|critical|p0|mustfix|高)$/.test(c)) return 'blocker'
-  if (/^(major|主要|重要|p1|中)$/.test(c)) return 'major'
-  if (/^(minor|次要|建议|p2|低|nit|polish)$/.test(c)) return 'minor'
+  if (/^(🔴|blocker|阻断|严重|致命|critical|p0|mustfix|高)$/.test(c)) return 'blocker'
+  if (/^(🟠|major|主要|重要|p1|中)$/.test(c)) return 'major'
+  if (/^(🟡|minor|次要|建议|p2|低|nit|polish)$/.test(c)) return 'minor'
   if (/^(info|提示|参考|p3)$/.test(c)) return 'info'
   return undefined
 }
@@ -176,21 +180,25 @@ export function parseReview(
   ): void => {
     const body = cleanCell(raw)
     if (isNoise(body)) return
-    const key = body.slice(0, 60)
-    if (seen.has(key)) return
-    seen.add(key)
     const derived = severityOf(raw)
     const sev = extra?.severity ?? derived.severity
     const source: ReviewItem['severitySource'] = extra?.severitySource ?? derived.source
     // 正文里出现的 "132:8240" 这种节点 id，自动认领 → 能在基准图上钉框
     const nodeMatch = raw.match(/(\d{1,6}:\d{1,6})/)
     const nodeId = nodeMatch ? nodeMatch[1] : undefined
+    const location = extra?.location ?? locationOf(raw)
+    // 去重键 = 位置 + 节点 + 正文前 60。
+    // 只拿正文前 60 会把"同一条结构化评审"在不同行（列表项 / 纯文本规则）各解析一遍 →
+    // 一条被拆成多条 info，info 又可被 known-diff 吞掉，造成假绿；带上位置+节点后能认出是同一条。
+    const key = `${location ?? ''}|${nodeId ?? ''}|${body.slice(0, 60)}`
+    if (seen.has(key)) return
+    seen.add(key)
     out.push({
       id: '',
       severity: sev,
       severitySource: source,
       text: body.slice(0, 400),
-      location: extra?.location ?? locationOf(raw),
+      location,
       expected: extra?.expected,
       actual: extra?.actual,
       nodeId,

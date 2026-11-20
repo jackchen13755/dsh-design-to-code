@@ -71,6 +71,21 @@ export function evaluateCloseGate(input: GateInput): GateResult {
     return { ok: false, reason: `基准页还没有确认（confirmed=false）：先让用户确认 ${flow.staticPage ?? 'static/index.html'}，再 figma_confirm_static。` }
   }
 
+  // ⑤ 视觉回归门禁（fail-closed）：没有 visualDiff 记录，或 clean=false 且没有任何 knownDiffs 被显式接受，
+  //    都不许收尾。knownDiffs 非空 = 调用方已在 figma_confirm_static 里显式登记"这部分差异接受"，
+  //    是唯一能越过 clean 的凭据；没登记就一律拒绝，绝不把"没跑机器回归"当成"没问题"。
+  //    注意：这里只读 knownDiffs / confirmedVia，不写回 flow，confirmedVia=expert_review 的确认来源原样保留。
+  const vd = flow.visualDiff
+  const hasAcceptedDiffs = (flow.knownDiffs ?? []).length > 0
+  if ((!vd || !vd.clean) && !hasAcceptedDiffs) {
+    return {
+      ok: false,
+      reason: vd
+        ? `自动视觉回归未通过（visualDiff.clean=false，findings=${vd.findings}，报告 ${vd.reportPath}）：差异必须清零，或由 figma_confirm_static 登记为 knownDiffs 显式接受后再收尾。`
+        : '缺少自动视觉回归记录（flow.json 无 visualDiff）：先跑 figma_visual_diff(output_dir=…, impl=<实现页>)，或由 figma_confirm_static 登记 knownDiffs 显式接受后再收尾。',
+    }
+  }
+
   const reviews = flow.reviews ?? []
   const implItems = reviews
     .filter((r) => (r.scope ?? 'implementation') === 'implementation')
