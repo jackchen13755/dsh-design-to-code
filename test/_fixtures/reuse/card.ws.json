@@ -1,0 +1,79 @@
+{
+  "fileKey": "REUSE-FIXTURE",
+  "nodeId": "2:1",
+  "node": {
+    "guid": { "sessionID": 2, "localID": 1 },
+    "type": "FRAME",
+    "name": "CardPage",
+    "transform": { "m00": 1, "m01": 0, "m02": 0, "m10": 0, "m11": 1, "m12": 0 },
+    "size": { "x": 1200, "y": 800 },
+    "visible": true,
+    "fillPaints": [{ "type": "SOLID", "color": { "r": 1, "g": 1, "b": 1, "a": 1 }, "opacity": 1, "visible": true, "blendMode": "NORMAL" }]
+  },
+  "descendants": [
+    {
+      "guid": { "sessionID": 2, "localID": 2 },
+      "type": "ROUNDED_RECTANGLE",
+      "name": "BG",
+      "transform": { "m00": 1, "m01": 0, "m02": 0, "m10": 0, "m11": 1, "m12": 0 },
+      "size": { "x": 1200, "y": 800 },
+      "visible": true,
+      "parentIndex": { "guid": { "sessionID": 2, "localID": 1 } },
+      "fillPaints": [{ "type": "SOLID", "color": { "r": 0.95, "g": 0.95, "b": 0.95, "a": 1 }, "opacity": 1, "visible": true, "blendMode": "NORMAL" }]
+    },
+    {
+      "guid": { "sessionID": 2, "localID": 3 },
+      "type": "FRAME",
+      "name": "Card",
+      "transform": { "m00": 1, "m01": 0, "m02": 360, "m10": 0, "m11": 1, "m12": 240 },
+      "size": { "x": 480, "y": 320 },
+      "visible": true,
+      "parentIndex": { "guid": { "sessionID": 2, "localID": 1 } },
+      "fillPaints": [{ "type": "SOLID", "color": { "r": 1, "g": 1, "b": 1, "a": 1 }, "opacity": 1, "visible": true, "blendMode": "NORMAL" }]
+    },
+    {
+      "guid": { "sessionID": 2, "localID": 4 },
+      "type": "FRAME",
+      "name": "CardHeader",
+      "transform": { "m00": 1, "m01": 0, "m02": 360, "m10": 0, "m11": 1, "m12": 240 },
+      "size": { "x": 480, "y": 64 },
+      "visible": true,
+      "parentIndex": { "guid": { "sessionID": 2, "localID": 3 } }
+    },
+    {
+      "guid": { "sessionID": 2, "localID": 5 },
+      "type": "TEXT",
+      "name": "卡片标题",
+      "transform": { "m00": 1, "m01": 0, "m02": 380, "m10": 0, "m11": 1, "m12": 260 },
+      "size": { "x": 200, "y": 24 },
+      "visible": true,
+      "parentIndex": { "guid": { "sessionID": 2, "localID": 4 } },
+      "textData": { "characters": "任务概览" },
+      "fontName": { "family": "Inter", "style": "Medium" },
+      "fontSize": 16,
+      "fillPaints": [{ "type": "SOLID", "color": { "r": 0.1, "g": 0.1, "b": 0.1, "a": 1 }, "opacity": 1, "visible": true, "blendMode": "NORMAL" }]
+    },
+    {
+      "guid": { "sessionID": 2, "localID": 6 },
+      "type": "FRAME",
+      "name": "CardBody",
+      "transform": { "m00": 1, "m01": 0, "m02": 360, "m10": 0, "m11": 1, "m12": 304 },
+      "size": { "x": 480, "y": 256 },
+      "visible": true,
+      "parentIndex": { "guid": { "sessionID": 2, "localID": 3 } }
+    },
+    {
+      "guid": { "sessionID": 2, "localID": 7 },
+      "type": "TEXT",
+      "name": "卡片内容",
+      "transform": { "m00": 1, "m01": 0, "m02": 380, "m10": 0, "m11": 1, "m12": 324 },
+      "size": { "x": 300, "y": 20 },
+      "visible": true,
+      "parentIndex": { "guid": { "sessionID": 2, "localID": 6 } },
+      "textData": { "characters": "共 12 条待办" },
+      "fontName": { "family": "Inter", "style": "Regular" },
+      "fontSize": 14,
+      "fillPaints": [{ "type": "SOLID", "color": { "r": 0.3, "g": 0.3, "b": 0.3, "a": 1 }, "opacity": 1, "visible": true, "blendMode": "NORMAL" }]
+    }
+  ]
+}

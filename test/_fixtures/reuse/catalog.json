@@ -1,0 +1,50 @@
+[
+  {
+    "name": "Drawer",
+    "importPath": "@/components/Drawer",
+    "props": ["open", "onClose", "title", "width"],
+    "slots": ["content", "header", "footer"],
+    "usageSample": "<Drawer open={open} onClose={onClose} title={title}>{content}</Drawer>",
+    "sourceFile": "src/components/Drawer.tsx"
+  },
+  {
+    "name": "Modal",
+    "importPath": "@/components/Modal",
+    "props": ["open", "onCancel", "title", "footer"],
+    "slots": ["content", "header"],
+    "usageSample": "<Modal open={open} onCancel={onCancel} title={title}>{content}</Modal>",
+    "sourceFile": "src/components/Modal.tsx"
+  },
+  {
+    "name": "Card",
+    "importPath": "@/components/Card",
+    "props": ["title", "cover", "bordered"],
+    "slots": ["content", "header", "extra"],
+    "usageSample": "<Card title={title} bordered>{content}</Card>",
+    "sourceFile": "src/components/Card.tsx"
+  },
+  {
+    "name": "Input",
+    "importPath": "@/components/Input",
+    "props": ["value", "onChange", "placeholder", "disabled"],
+    "slots": [],
+    "usageSample": "<Input value={value} onChange={onChange} placeholder={placeholder} />",
+    "sourceFile": "src/components/Input.tsx"
+  },
+  {
+    "name": "Select",
+    "importPath": "@/components/Select",
+    "props": ["value", "onChange", "options", "multiple"],
+    "slots": [],
+    "usageSample": "<Select value={value} onChange={onChange} options={options} />",
+    "sourceFile": "src/components/Select.tsx"
+  },
+  {
+    "name": "Tag",
+    "importPath": "@/components/Tag",
+    "props": ["color", "closable", "onClose"],
+    "slots": ["content"],
+    "usageSample": "<Tag color={color} closable>{content}</Tag>",
+    "sourceFile": "src/components/Tag.tsx"
+  }
+]

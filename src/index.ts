@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from 'schemastery'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -64,6 +64,267 @@ export function normalizeNodeId(raw: string): string {
   if (/^\d+-\d+$/.test(s)) return s.replace('-', ':')
   if (/^\d+:\d+$/.test(s)) return s
   throw new Error(`非法 node-id（应为 数字-数字 或 数字:数字）：${JSON.stringify(original)} → ${JSON.stringify(s)}；绝不猜节点`)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 组件复用（只读消费席位A src/reuse-contract.ts 的导出）
+// 用动态 import + 变量说明符：席位A 未落地时既不让 typecheck 报 TS2307，
+// 也不让现有测试整体崩；真正用到复用能力时才要求该文件存在。
+// ─────────────────────────────────────────────────────────────────────
+const REUSE_CONTRACT_SPEC = './reuse-contract.js'
+type ReusePolicy = 'off' | 'auto' | 'explicit'
+
+interface ReuseContractLite {
+  id?: string
+  designNodeId?: string
+  designName?: string
+  level?: string
+  role?: string
+  projectComponent?: string
+  importPath?: string
+  match?: { source?: string; confidence?: number; status?: string; evidence?: string }
+  status?: string
+  verify?: { nodeId?: string; note?: string }
+  [k: string]: unknown
+}
+interface ReuseModuleLite {
+  planComponentReuse?: (root: any, opts: { contracts?: any[]; catalog?: any[]; policy: ReusePolicy }) => any[] | Promise<any[]>
+  writeComponentCatalog?: (catalog: any[], path: string) => void | Promise<void>
+  readComponentCatalog?: (path: string) => any[]
+}
+
+async function loadReuseModule(): Promise<ReuseModuleLite | null> {
+  try {
+    return (await import(REUSE_CONTRACT_SPEC)) as ReuseModuleLite
+  } catch {
+    return null
+  }
+}
+
+export function normalizeReusePolicy(raw?: string): ReusePolicy {
+  const p = String(raw ?? 'auto').trim() as ReusePolicy
+  if (p === 'off' || p === 'auto' || p === 'explicit') return p
+  throw new Error(`非法 reuse_policy：${JSON.stringify(raw)}；只接受 off / auto / explicit`)
+}
+
+/** confirmed 判定：席位A 的 status 在 match.status；兼容顶层 status（防御式） */
+export function isConfirmedReuseContract(c: ReuseContractLite): boolean {
+  if (!c || typeof c !== 'object') return false
+  return c.match?.status === 'confirmed' || c.status === 'confirmed'
+}
+
+/** 把 component-reuse.json 的各种包裹形状归一成契约数组 */
+export function normalizeReuseContracts(raw: unknown): ReuseContractLite[] {
+  if (Array.isArray(raw)) return raw as ReuseContractLite[]
+  if (raw && typeof raw === 'object') {
+    const o = raw as Record<string, unknown>
+    for (const k of ['contracts', 'reuseContracts']) {
+      if (Array.isArray(o[k])) return o[k] as ReuseContractLite[]
+    }
+  }
+  return []
+}
+
+/**
+ * 解析 reuse_contract：JSON 串或文件路径；解析失败抛明确错误（仿 normalizeNodeId 的 fail-closed）。
+ * 返回契约数组（空串/undefined → undefined，表示未提供）。
+ */
+export function parseReuseContractInput(raw?: string): ReuseContractLite[] | undefined {
+  const s = String(raw ?? '').trim()
+  if (!s) return undefined
+  let parsed: unknown
+  const looksJson = s.startsWith('{') || s.startsWith('[')
+  if (looksJson) {
+    try {
+      parsed = JSON.parse(s)
+    } catch (e) {
+      throw new Error(`非法 reuse_contract（JSON 解析失败）：${JSON.stringify(s.slice(0, 160))}；请传合法 JSON 串或文件路径：${e instanceof Error ? e.message : String(e)}`)
+    }
+  } else {
+    const p = resolve(s)
+    if (!existsSync(p)) throw new Error(`非法 reuse_contract（文件不存在）：${s}（解析为 ${p}）；请传契约 JSON 串或已存在的文件路径`)
+    let txt: string
+    try {
+      txt = readFileSync(p, 'utf8')
+    } catch (e) {
+      throw new Error(`reuse_contract 文件读取失败（${p}）：${e instanceof Error ? e.message : String(e)}`)
+    }
+    try {
+      parsed = JSON.parse(txt)
+    } catch (e) {
+      throw new Error(`非法 reuse_contract（文件不是合法 JSON）：${p}：${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+  const wrapped = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null
+  if (!Array.isArray(parsed) && !(wrapped && (Array.isArray(wrapped.contracts) || Array.isArray(wrapped.reuseContracts)))) {
+    // 单个契约对象也算合法（边界全覆盖：数组 / 包裹对象 / 单对象）
+    if (wrapped && typeof wrapped.projectComponent === 'string') return [wrapped as ReuseContractLite]
+    throw new Error(`非法 reuse_contract：顶层必须是契约数组（或含 contracts / reuseContracts 数组的对象），实际为 ${Array.isArray(parsed) ? 'array' : typeof parsed}`)
+  }
+  return normalizeReuseContracts(parsed)
+}
+
+/** 从 code_dir 探测 component-catalog.json（浅层常见落点，不递归整棵项目） */
+async function findCatalogInCodeDir(dir: string): Promise<string | null> {
+  for (const n of ['component-catalog.json', 'components/component-catalog.json', '.dsh/component-catalog.json', 'doc/component-catalog.json']) {
+    const p = join(dir, n)
+    if (existsSync(p)) return p
+  }
+  return null
+}
+
+async function readCatalog(mod: ReuseModuleLite | null, path: string): Promise<any[]> {
+  if (mod?.readComponentCatalog) return await mod.readComponentCatalog(path)
+  try {
+    const j = JSON.parse(readFileSync(path, 'utf8'))
+    if (Array.isArray(j)) return j
+    if (Array.isArray(j?.components)) return j.components
+    return []
+  } catch {
+    return []
+  }
+}
+
+async function writeCatalog(mod: ReuseModuleLite | null, catalog: any[], path: string): Promise<void> {
+  if (mod?.writeComponentCatalog) await mod.writeComponentCatalog(catalog, path)
+  else await writeFile(path, JSON.stringify(catalog, null, 2), 'utf8')
+}
+
+/** 读已落盘的 component-reuse.json（gen/ 优先，兼容父目录） */
+async function readReuseContracts(outDir: string): Promise<ReuseContractLite[]> {
+  const candidates = [
+    join(outDir, 'gen', 'component-reuse.json'),
+    join(outDir, 'component-reuse.json'),
+    join(resolve(outDir, '..'), 'gen', 'component-reuse.json'),
+  ]
+  for (const p of candidates) {
+    if (!existsSync(p)) continue
+    try {
+      return normalizeReuseContracts(JSON.parse(await readFile(p, 'utf8')))
+    } catch {
+      /* 坏了就试下一个 */
+    }
+  }
+  return []
+}
+
+/**
+ * 接线主路径：解析契约 → 读/探测 catalog → planComponentReuse → 落盘两份产物。
+ * policy='off' 全跳过（T14 向后兼容）。返回 hasConfirmed 供收尾门禁用。
+ */
+async function prepareReuseArtifacts(params: {
+  outDir: string
+  policyRaw?: string
+  contractRaw?: string
+  catalogPathRaw?: string
+  codeDirRaw?: string
+  /** P1 修复：detectProjectConventions 真正打开组件文件解析出的 catalog（code-dir 匹配所需，否则探组件成了死代码） */
+  autoCatalog?: any[]
+  root?: any
+}): Promise<{ contracts: ReuseContractLite[]; hasConfirmed: boolean; catalogWritten: boolean; policy: ReusePolicy }> {
+  const policy = normalizeReusePolicy(params.policyRaw)
+  if (policy === 'off') return { contracts: [], hasConfirmed: false, catalogWritten: false, policy }
+
+  const explicit = parseReuseContractInput(params.contractRaw)
+  const mod = await loadReuseModule()
+  const genDir = join(params.outDir, 'gen')
+  await mkdir(genDir, { recursive: true })
+
+  // catalog：component_catalog 路径 > code_dir 现场探测解析(conventions.components) > 磁盘已有 catalog。
+  // P1 修复：此前只看路径/磁盘文件，detectProjectConventions 解析出的 components 从未接入 →
+  // 单传 code_dir 时 catalog 恒空、code-dir confirmed 永不触发，machine gate 形同虚设。
+  let catalog: any[] | undefined
+  if (params.catalogPathRaw) {
+    const p = resolve(params.catalogPathRaw)
+    if (!existsSync(p)) throw new Error(`component_catalog 文件不存在：${params.catalogPathRaw}（解析为 ${p}）`)
+    catalog = await readCatalog(mod, p)
+  } else if (Array.isArray(params.autoCatalog) && params.autoCatalog.length) {
+    catalog = params.autoCatalog
+  } else if (params.codeDirRaw) {
+    const found = await findCatalogInCodeDir(resolve(params.codeDirRaw))
+    if (found) catalog = await readCatalog(mod, found)
+  }
+
+  let contracts: ReuseContractLite[] = []
+  if (mod?.planComponentReuse && params.root) {
+    // 席位A：root 是 DesignNode；有真实设计树时走计划（显式契约 / catalog 真匹配 → confirmed）
+    contracts = normalizeReuseContracts(await mod.planComponentReuse(params.root, { contracts: explicit, catalog, policy }))
+  } else if (explicit) {
+    // 没有席位A 模块或没有设计树（如 codegen_round）：显式契约按冻结语义 = confirmed 落盘
+    // （status 强制覆盖，避免用户漏写导致门禁不触发；与席位A 的 explicit→confirmed 一致）
+    contracts = explicit.map((c) => ({
+      ...c,
+      match: { source: 'explicit', confidence: 1, evidence: 'reuse_contract 显式传入', ...(c.match ?? {}), status: 'confirmed' },
+      status: 'confirmed',
+    }))
+  } else {
+    // 幂等：复用已落盘的契约（codegen_round 不重新计划）
+    contracts = await readReuseContracts(params.outDir)
+  }
+
+  await writeFile(join(genDir, 'component-reuse.json'), JSON.stringify(contracts, null, 2), 'utf8')
+  let catalogWritten = false
+  if (catalog && catalog.length) {
+    await writeCatalog(mod, catalog, join(genDir, 'component-catalog.json'))
+    catalogWritten = true
+  }
+  return { contracts, hasConfirmed: contracts.some(isConfirmedReuseContract), catalogWritten, policy }
+}
+
+/** 单个组件名是否在源码里被 import/require 或 JSX 使用（静态扫描，边界全覆盖） */
+function componentReferenced(source: string, component: string): boolean {
+  const simple = String(component || '').trim().split('/').pop()!.replace(/\.[^.]+$/, '')
+  if (!simple) return false
+  const esc = simple.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const namedImport = new RegExp(`import\\s*\\{[^}]*\\b${esc}\\b[^}]*\\}\\s*from`, 'm')
+  const defaultImport = new RegExp(`import\\s+${esc}\\s*(?:,|from\\b)`, 'm')
+  const pathRef = new RegExp(`(?:from\\s*|require\\s*\\(\\s*)['"][^'"]*\\b${esc}\\b[^'"]*['"]`, 'm')
+  const jsx = new RegExp(`<\\s*${esc}(?=[\\s/>.,])`, 'm')
+  return namedImport.test(source) || defaultImport.test(source) || pathRef.test(source) || jsx.test(source)
+}
+
+/** 收集 impl_src（文件或目录）下可扫描的源码文件；跳过 node_modules/.git/dist/build */
+function collectReuseSourceFiles(implSrc: string): string[] {
+  const root = resolve(String(implSrc ?? ''))
+  const out: string[] = []
+  const walk = (p: string): void => {
+    let st
+    try { st = statSync(p) } catch { return }
+    if (st.isDirectory()) {
+      for (const e of readdirSync(p)) {
+        if (e === 'node_modules' || e === '.git' || e === 'dist' || e === 'build') continue
+        walk(join(p, e))
+      }
+    } else if (st.isFile() && /\.(tsx?|jsx?|mjs|cjs|vue)$/i.test(p)) {
+      out.push(p)
+    }
+  }
+  walk(root)
+  return out
+}
+
+/**
+ * 纯函数：静态核对 confirmed 契约的 projectComponent 是否真的在实现源码出现。
+ * 不写 flow.json（写回由 figma_verify_reuse 工具层做）。
+ */
+export function verifyReuseImports(
+  contracts: ReuseContractLite[],
+  implSrcDir: string,
+): { clean: boolean; missingImports: string[]; hits: string[] } {
+  const sources: string[] = []
+  for (const p of collectReuseSourceFiles(implSrcDir)) {
+    try { sources.push(readFileSync(p, 'utf8')) } catch { /* 读不到当空 */ }
+  }
+  const hits: string[] = []
+  const missingImports: string[] = []
+  for (const c of contracts ?? []) {
+    if (!isConfirmedReuseContract(c)) continue
+    const name = String(c.projectComponent ?? '').trim()
+    if (!name) continue
+    if (sources.some((src) => componentReferenced(src, name))) hits.push(name)
+    else missingImports.push(name)
+  }
+  return { clean: missingImports.length === 0, missingImports, hits }
 }
 
 function parseNodeUrl(url: string): { fileKey: string; nodeId: string } {
@@ -819,6 +1080,9 @@ export function apply(ctx: Context, config: Config): void {
         skip_static_check: { type: 'boolean', description: 'true = 跳过"必须有视觉基准页"的硬门禁（只想要几何数据时用；会留痕）' },
         round: { type: 'number', description: '生成轮次（默认 1）' },
         round_feedback: { type: 'string', description: '上一轮反馈（round>1）' },
+        reuse_contract: { type: 'string', description: '复用契约（JSON 串或文件路径，默认空；显式条目 status=confirmed）。项目组件库优先复用：confirmed 契约会写进 gen/component-reuse.json 并作为收尾机器门禁依据' },
+        reuse_policy: { type: 'string', description: "项目组件复用策略：'off' | 'auto' | 'explicit'（默认 'auto'；'off' 时不生成 component-reuse.json / Prompt 段且 verify 跳过）" },
+        component_catalog: { type: 'string', description: 'catalog json 路径（可选）；不传则从 code_dir 浅探测 component-catalog.json。探测到会写 gen/component-catalog.json' },
       },
       output: {
         schema: { type: 'string' },
@@ -828,6 +1092,7 @@ export function apply(ctx: Context, config: Config): void {
         requirements?: string; conventions?: string; component_name?: string
         audit_path?: string; static_page?: string; round?: number; round_feedback?: string
         skip_static_check?: boolean; code_dir?: string; max_extract?: number
+        reuse_contract?: string; reuse_policy?: string; component_catalog?: string
       }) {
         const { nodeJson, fileKey, nodeId, outDir } = await loadNodeJson(args, config)
 
@@ -885,6 +1150,23 @@ export function apply(ctx: Context, config: Config): void {
         const planPath = join(dir, 'component-plan.md')
         await writeFile(planPath, componentPlanMd, 'utf8')
 
+        // 组件复用接线（席位A 契约 → 产物 → 席位B Prompt 段）；policy=off 全跳过（T14）
+        const reuseArtifacts = await prepareReuseArtifacts({
+          outDir,
+          policyRaw: args.reuse_policy,
+          contractRaw: args.reuse_contract,
+          catalogPathRaw: args.component_catalog,
+          codeDirRaw: args.code_dir,
+          // P1 修复：把 detectProjectConventions 现场解析出的组件目录接进 planner，
+          // 否则单传 code_dir 时 catalog 恒空、code-dir confirmed 永不触发。
+          autoCatalog: conventions?.components,
+          // 席位A 冻结契约：planComponentReuse 要的是 DesignNode 子树根（DesignModel.tree），
+          // 不是 raw WS json（{node,descendants}）也不是整个 DesignModel。
+          root: (model as { tree?: unknown }).tree ?? model,
+        })
+        // 席位B 的 CodegenOptions.reuseContracts 尚未落地时用 spread 规避 TS 多余属性检查；
+        // 落地后该 spread 原样兼容（字段逐字 reuseContracts）。
+        const reuseExtras: Record<string, unknown> = { reuseContracts: reuseArtifacts.contracts }
         const files = generateCode(model, {
           componentName,
           requirements: args.requirements || '（未提供需求，按设计稿默认交互：表单输入 + 按钮动作 + 关闭）',
@@ -899,6 +1181,7 @@ export function apply(ctx: Context, config: Config): void {
           maxExtract: args.max_extract,
           round,
           roundFeedback: args.round_feedback || '',
+          ...reuseExtras,
         })
         await writeFile(join(dir, '.codegen-round'), String(round), 'utf8')
         const prevFound = await findFlow(outDir)
@@ -920,6 +1203,9 @@ export function apply(ctx: Context, config: Config): void {
             ? `- 项目约定探测：组件根 \`${conventions.componentsRoot ?? '未识别'}\` · 形态 ${conventions.layout} · 样式 ${conventions.styleExt ?? '未识别'}`
             : '- ⚠️ 未传 code_dir：无法探测项目组件落点（新组件位置只能靠会话自己看项目）',
           `- 组件化方案：${planPath}`,
+          reuseArtifacts.policy === 'off'
+            ? '- 组件复用：reuse_policy=off（未生成契约/Prompt 段，收尾复用门禁跳过）'
+            : `- 组件复用：策略 ${reuseArtifacts.policy} · 契约 ${reuseArtifacts.contracts.length} 条（confirmed ${reuseArtifacts.contracts.filter(isConfirmedReuseContract).length} 条）→ gen/component-reuse.json${reuseArtifacts.catalogWritten ? ' · catalog → gen/component-catalog.json' : ''}`,
           `- 输出：${dir}`,
           '',
           '生成文件：',
@@ -947,16 +1233,35 @@ export function apply(ctx: Context, config: Config): void {
         conventions: { type: 'string', description: '项目约定（可省略）' },
         force: { type: 'boolean', description: 'true = 显式越过收尾门禁（必须同时给 force_reason；会写入 flow.json 留痕）' },
         force_reason: { type: 'string', description: 'force 的理由（必填，会写进 flow.json 并在输出里回显）' },
+        reuse_contract: { type: 'string', description: '复用契约（JSON 串或文件路径，默认空；显式条目 status=confirmed）。有 confirmed 契约且无 figma_verify_reuse 记录时收尾会被拒' },
+        reuse_policy: { type: 'string', description: "项目组件复用策略：'off' | 'auto' | 'explicit'（默认 'auto'；'off' 时收尾复用门禁跳过）" },
+        component_catalog: { type: 'string', description: 'catalog json 路径（可选）；用于刷新 gen/component-catalog.json' },
       },
       output: {
         schema: { type: 'string' },
         render: (_args: unknown, value: unknown) => [textBlock(String(value))],
       },
-      async execute(args: { output_dir: string; round_feedback: string; requirements?: string; conventions?: string; force?: boolean; force_reason?: string }) {
+      async execute(args: { output_dir: string; round_feedback: string; requirements?: string; conventions?: string; force?: boolean; force_reason?: string; reuse_contract?: string; reuse_policy?: string; component_catalog?: string }) {
         const dir = resolve(args.output_dir)
         // 【硬门禁】收尾迭代要求基准页已经人工确认过：迭代是"声称做完"的前一步，
         // 没人确认过基准就迭代，等于对着未确认的目标收敛。
         const found = await findFlow(dir)
+        // 复用接线：解析契约（失败即抛）→ 刷新两份产物 → 算出有无 confirmed 契约供收尾门禁用。
+        // policy=off 全跳过（T14），hasConfirmed=false → 完全向后兼容。
+        const policy = normalizeReusePolicy(args.reuse_policy)
+        let hasConfirmed = false
+        if (policy !== 'off' && (args.reuse_contract || args.component_catalog)) {
+          const reuse = await prepareReuseArtifacts({
+            outDir: found?.dir ?? dir,
+            policyRaw: args.reuse_policy,
+            contractRaw: args.reuse_contract,
+            catalogPathRaw: args.component_catalog,
+            root: undefined, // codegen_round 没有设计树；显式契约原样落盘
+          })
+          hasConfirmed = reuse.hasConfirmed
+        } else if (policy !== 'off') {
+          hasConfirmed = (await readReuseContracts(found?.dir ?? dir)).some(isConfirmedReuseContract)
+        }
         // 门禁集中判定（gate.ts，可单测）。fail-closed：旧目录 / 缺 flow.json / 未确认 一律拒绝。
         const staticPageOk = !!found?.flow.staticPage && existsSync(found.flow.staticPage)
         const specOk = existsSync(join(found?.dir ?? dir, 'static', 'spec.json'))
@@ -966,6 +1271,7 @@ export function apply(ctx: Context, config: Config): void {
           force: args.force,
           forceReason: args.force_reason,
           artifacts: { staticPage: staticPageOk, spec: specOk },
+          reuse: { hasConfirmed },
         })
         if (!gate.ok) {
           const reason = gate.reason ?? '门禁未通过'
@@ -985,6 +1291,17 @@ export function apply(ctx: Context, config: Config): void {
               '  4) 按条目改 → action="close" 逐条关闭（blocker/major 必须带 note: 文件:行 + 实测值）',
               '',
               '若当前环境没有可用的 UI 专家（Agency 设置里未启用），可传 force=true 显式越过；会留痕，交付时须注明「未经专家审计」。',
+            ].join('\n'))
+          }
+          if (reason.includes('复用') || reason.includes('reuseVerification')) {
+            throw new Error([
+              `拒绝收尾：${reason}`,
+              '',
+              '复用门禁闭环：',
+              '  1) 按 confirmed 契约的 projectComponent 在实现源码里补齐真实 import / JSX 引用（优先复用项目既有组件，不要另写一份）；',
+              `  2) figma_verify_reuse(output_dir="${found?.dir ?? dir}", impl_src=<实现源码目录或文件>) → 写回 flow.json 的 reuseVerification；`,
+              '  3) 再跑本工具收尾。',
+              '若确属合理例外，可由 figma_confirm_static 登记 knownDiffs 显式接受。',
             ].join('\n'))
           }
           throw new Error(`拒绝收尾：${reason}\n确需越过请显式传 force=true 且给 force_reason（会写进 flow.json 留痕）。`)
@@ -1031,6 +1348,76 @@ export function apply(ctx: Context, config: Config): void {
           '',
           '流程：按更新后的 CODEGEN_PROMPT.md 改 → 组件渲染截图 ↔ 静态基准页对照 → 差异清零后结束。',
         ].join('\n')
+      },
+    })))
+    // ── 工具 3b：组件复用静态核对（把"说复用了"变成机器门禁） ──
+    disposers.push(ctx.tools.register(defineTool({
+      name: 'figma_verify_reuse',
+      description: '静态核对 confirmed 复用契约的 projectComponent 是否真的在实现源码 import/require 或 JSX 出现：读 gen/component-reuse.json，扫描 impl_src，输出命中/缺失清单，写回 flow.json 的 reuseVerification；clean=缺失为 0。reuse_policy=off（未生成契约）时跳过。impl_src 不存在或无可扫源码会抛明确错误',
+      parameters: {
+        output_dir: { type: 'string', description: '输出目录（figma_gen_component 的 output_dir 或其 gen 子目录）' },
+        impl_src: { type: 'string', description: '实现源码目录或文件路径（静态扫描 import/require 与 JSX 标签）' },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_args: unknown, value: unknown) => [textBlock(String(value))],
+      },
+      async execute(args: { output_dir: string; impl_src: string }) {
+        const dir = resolve(args.output_dir)
+        const found = await findFlow(dir)
+        const flowDir = found?.dir ?? dir
+
+        // 找契约产物；找不到 = policy=off 或还没生成 → 跳过（T14 向后兼容）
+        let contractPath: string | null = null
+        for (const p of [join(dir, 'gen', 'component-reuse.json'), join(dir, 'component-reuse.json'), join(resolve(dir, '..'), 'gen', 'component-reuse.json')]) {
+          if (existsSync(p)) { contractPath = p; break }
+        }
+        if (!contractPath) {
+          return '⏭️ 复用核对跳过：找不到 component-reuse.json（reuse_policy=off 或尚未运行 figma_gen_component）；无需写 reuseVerification。'
+        }
+
+        let contracts: ReuseContractLite[]
+        try {
+          contracts = normalizeReuseContracts(JSON.parse(await readFile(contractPath, 'utf8')))
+        } catch (e) {
+          throw new Error(`component-reuse.json 解析失败（${contractPath}）：${e instanceof Error ? e.message : String(e)}`)
+        }
+
+        // impl_src 边界：不存在 / 无可扫文件 → 抛明确错误（fail-closed，绝不静默 clean:true）
+        const implSrc = String(args.impl_src ?? '').trim()
+        if (!implSrc) throw new Error('figma_verify_reuse 缺少 impl_src（实现源码目录或文件路径）')
+        if (!existsSync(resolve(implSrc))) throw new Error(`impl_src 不存在：${implSrc}（解析为 ${resolve(implSrc)}）`)
+        const files = collectReuseSourceFiles(implSrc)
+        if (!files.length) {
+          throw new Error(`impl_src 下没有可扫描的源码文件（.ts/.tsx/.js/.jsx/.mjs/.cjs/.vue）：${implSrc}；绝不把"没扫到"当成"复用通过"`)
+        }
+
+        const res = verifyReuseImports(contracts, implSrc)
+        const confirmed = contracts.filter(isConfirmedReuseContract)
+        const unconfirmed = contracts.filter((c) => !isConfirmedReuseContract(c)).map((c) => String(c.projectComponent ?? c.id ?? '(无名契约)'))
+        await writeFlow(flowDir, {
+          stage: found?.flow.stage ?? 'skeleton_generated',
+          nodeId: found?.flow.nodeId ?? '',
+          fileKey: found?.flow.fileKey ?? '',
+          reuseVerification: {
+            at: new Date().toISOString(),
+            checked: true,
+            clean: res.clean,
+            missingImports: res.missingImports,
+          },
+        })
+        return [
+          res.clean ? '✅ 组件复用静态核对通过（confirmed 契约的 projectComponent 全部命中）' : '❌ 组件复用静态核对未通过（有 confirmed 契约的 projectComponent 未在实现源码出现）',
+          `- 契约产物：${contractPath}（共 ${contracts.length} 条，confirmed ${confirmed.length} 条）`,
+          `- 扫描源码：${files.length} 个文件（impl_src=${implSrc}）`,
+          `- 命中：${res.hits.length ? res.hits.join(', ') : '（无）'}`,
+          `- 缺失 import：${res.missingImports.length ? res.missingImports.join(', ') : '（无）'}`,
+          unconfirmed.length ? `- 未确认（suspected，不纳入门禁）：${unconfirmed.join(', ')}` : '',
+          '',
+          res.clean
+            ? '收尾门禁的复用项已满足；仍须跑 figma_visual_diff 并过 UI 专家审计。'
+            : '按 confirmed 契约补齐 import/JSX 后重跑本工具；flow.json 的 reuseVerification 已写回（clean=false）。',
+        ].filter(Boolean).join('\n')
       },
     })))
     // ── 工具 4：自动视觉回归（把"肉眼找差异"换成可断言的数值差） ──

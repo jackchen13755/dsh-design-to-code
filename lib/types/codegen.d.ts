@@ -1,5 +1,6 @@
 import type { DesignModel } from './design.js';
 import type { AuditResult } from './audit.js';
+import type { ComponentReuseContract } from './reuse-contract.js';
 export interface CodegenOptions {
     componentName: string;
     requirements: string;
@@ -23,6 +24,8 @@ export interface CodegenOptions {
     /** 当前轮次 */
     round?: number;
     roundFeedback?: string;
+    /** 壳/组件级复用契约（席位A reuse-contract.ts 产出）；默认空，空时 Prompt 段与 Shell 骨架整段省略 */
+    reuseContracts?: ComponentReuseContract[];
 }
 export declare function generateCode(model: DesignModel, opts: CodegenOptions): string[];
 export declare function summarizeAudit(a: AuditResult): string;

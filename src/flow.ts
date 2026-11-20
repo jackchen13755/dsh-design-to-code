@@ -41,6 +41,12 @@ export interface FlowState {
    * checked=本次是否真的取到了可对照节点；findings=差异条数；clean=findings=0 且无未接受差异。
    */
   visualDiff?: { at: string; checked: boolean; findings: number; clean: boolean; reportPath: string }
+  /**
+   * 组件复用静态核对（figma_verify_reuse 写入）：confirmed 契约里的 projectComponent
+   * 是否真的在实现源码 import/JSX 出现。fail-closed，与 visualDiff 判定并列。
+   * checked=是否真的扫到了源码；clean=missingImports.length===0。
+   */
+  reuseVerification?: { at: string; checked: boolean; clean: boolean; missingImports: string[] }
   /** 属性来源台账摘要（placeholder 占比），门禁与交付说明引用 */
   coverage?: { nodes: number; placeholderRatio: number; counts: { design: number; inferred: number; placeholder: number }; summary: string }
   updatedAt: string

@@ -11,9 +11,10 @@
  *      → 新组件就按这个落点生成，不另起一套；
  *   3. 把"复用清单 / 新建清单 / 落点 / 命名"写成可核对的 plan（人看 + 注入 Codegen Prompt）。
  */
-import { readdirSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { join, relative, sep } from 'node:path'
 import type { DesignModel, DesignNode } from './design.js'
+import type { CatalogComponent } from './reuse-contract.js'
 
 export interface RepeatGroup {
   /** 结构指纹 */
@@ -59,7 +60,77 @@ export interface ProjectConventions {
   barrel?: boolean
   /** 现成组件名样例（供复用匹配） */
   sampleNames: string[]
+  /** ③ 探测深化：真正打开组件文件解析出的组件目录（props/slot/importPath/usage）。缺 codeDir 时不存在。 */
+  components?: CatalogComponent[]
 }
+
+/**
+ * ③ 探测深化：真正打开一个组件文件，解析导出组件名 / props 签名 / children·slot 用法 /
+ * importPath（相对项目根或 barrel）。解析失败返回 undefined——**不猜 props**。
+ */
+function parseComponentFile(absPath: string, codeDir: string): CatalogComponent | undefined {
+  let src: string
+  try { src = readFileSync(absPath, 'utf8') } catch { return undefined }
+  if (src.length > 400 * 1024) return undefined
+  const base = absPath.split(/[\\/]/).pop() ?? ''
+  const fileName = base.replace(/\.(tsx|jsx|vue|svelte)$/, '')
+
+  // 导出组件名：export default function X / export function X / export const X / export default X
+  const name =
+    src.match(/export\s+default\s+(?:function|class)\s+([A-Z][\w]*)/)?.[1] ??
+    src.match(/export\s+(?:function|class)\s+([A-Z][\w]*)/)?.[1] ??
+    src.match(/export\s+(?:const|let)\s+([A-Z][\w]*)/)?.[1] ??
+    (fileName && /^[A-Z]/.test(fileName) ? fileName : undefined)
+  if (!name) return undefined
+
+  // props：优先 TS interface/type XxxProps { ... }，其次函数形参解构 ({ a, b }: Props)
+  const props: string[] = []
+  const propSeen = new Set<string>()
+  const pushProps = (blob: string): void => {
+    for (const m of blob.matchAll(/(?:^|[,;{\n])\s*([A-Za-z_$][\w$]*)\s*\??\s*:/g)) {
+      const p = m[1]
+      if (!propSeen.has(p)) { propSeen.add(p); props.push(p) }
+    }
+  }
+  const iface = src.match(/(?:interface|type)\s+\w*Props\w*\s*(?:=[^\{]*)?\{([\s\S]*?)\}/i)
+  if (iface) pushProps(iface[1])
+  if (!props.length) {
+    const destruct = src.match(/(?:function\s+\w+|\bconst\s+\w+)\s*[=]?\s*\(?\s*\{([^}]{1,1200})\}\s*[:)]/)
+    if (destruct) {
+      for (const m of destruct[1].matchAll(/([A-Za-z_$][\w$]*)\s*[,:=]/g)) {
+        const p = m[1]
+        if (!propSeen.has(p) && !['children', 'props'].includes(p)) { propSeen.add(p); props.push(p) }
+      }
+    }
+  }
+
+  // slots：children / ReactNode props / 显式 slot 字段
+  const slots: string[] = []
+  const slotSeen = new Set<string>()
+  const pushSlot = (s: string): void => { if (!slotSeen.has(s)) { slotSeen.add(s); slots.push(s) } }
+  if (/\bchildren\b/.test(src) || /PropsWithChildren/.test(src)) pushSlot('children')
+  for (const m of src.matchAll(/([A-Za-z_$][\w$]*)\s*\??\s*:\s*(?:React\.)?ReactNode/g)) pushSlot(m[1])
+  for (const kw of ['header', 'footer', 'extra', 'content', 'title', 'prefix', 'suffix']) {
+    if (new RegExp(`\\b${kw}Slot\\b`, 'i').test(src)) pushSlot(kw)
+  }
+
+  const rel = relative(codeDir, absPath).split(sep).join('/')
+  const importPath = rel.replace(/\.(tsx|jsx|vue|svelte)$/, '').replace(/\/index$/, '')
+  return { name, importPath, props, slots, sourceFile: rel }
+}
+
+/** 在已扫描的文件里 grep 一个组件的 JSX 使用，取一个真实 usage 样例（保守：只取字面匹配行） */
+function findUsageSample(files: Array<{ abs: string; src: string }>, name: string): string | undefined {
+  const re = new RegExp(`<${name}[\\s/>]`)
+  for (const f of files) {
+    if (f.abs.endsWith('/' + name + '.tsx') || f.abs.endsWith('/' + name + '.jsx')) continue
+    const line = f.src.split(/\r?\n/).find((l) => re.test(l))
+    if (line) return line.trim().slice(0, 300)
+  }
+  return undefined
+}
+
+const PAGE_DIR = /(?:^|\/)(pages|views|screens)(\/|$)/i
 
 const SKIP_DIR = /(^|\/)(node_modules|\.git|dist|build|coverage|\.next|out|__snapshots__|\.cache|vendor|assets|locale|images?)(\/|$)/
 
@@ -134,7 +205,8 @@ export function detectRepeats(model: DesignModel, opts: { minCount?: number; min
 
     // 该不该抽组件：有 props（承载文案/数据）才叫可复用；
     // 纯结构容器（Row/Header/Frame 1171278644/title…）抽出来没人会复用，反而制造垃圾组件。
-    const STRUCTURAL = /^(frame\s*\d+|group\s*\d+|row|header|footer|title|container|body|content|wrapper|内容|吸底|抽屉|drawer|content-wrapper|rect(angle)?\d*)$/i
+    // 通用结构性容器图层名（非具体业务组件名；用角色词而非特定控件名）
+    const STRUCTURAL = /^(frame\s*\d+|group\s*\d+|row|header|footer|title|container|body|content|wrapper|内容|吸底|content-wrapper|rect(angle)?\d*)$/i
     const hasProps = props.length > 0
     const meaningful = !STRUCTURAL.test(String(rep.name).trim())
     // 两个条件都要满足：① 图层名有语义（不是 Row/Header/Frame 1171278644 这种结构容器）；
@@ -292,14 +364,16 @@ export function detectProjectConventions(codeDir: string, opts: { maxFiles?: num
   const evidence: string[] = []
   const hasBarrel = new Set<string>()
   let scanned = 0
+  /** ③ 收集组件文件内容（受 maxFiles 限制）供真正解析；④ pages/views 文件也进此列表作整页参考 */
+  const componentFiles: Array<{ abs: string; src: string }> = []
 
   const stack: string[] = [codeDir]
   while (stack.length && scanned < maxFiles) {
     const dir = stack.pop()!
     let entries: string[]
     try { entries = readdirSync(dir) } catch { continue }
-    const rel = dir.slice(codeDir.length + 1) || '.'
-    if (/components?$/i.test(dir.split('/').pop() ?? '')) {
+    const rel = dir.slice(codeDir.length + 1).replace(/\\/g, '/') || '.'
+    if (/components?$/i.test(dir.split(/[\\/]/).pop() ?? '')) {
       if (entries.includes('index.ts') || entries.includes('index.tsx')) hasBarrel.add(rel)
     }
     for (const e of entries) {
@@ -310,7 +384,14 @@ export function detectProjectConventions(codeDir: string, opts: { maxFiles?: num
       if (st.isDirectory()) { stack.push(p); continue }
       if (!COMPONENT_FILE.test(e) || st.size > 400 * 1024) continue
       scanned++
-      const compRoot = dir.replace(/\/[^/]+$/, '')
+      const relFile = p.slice(codeDir.length + 1).replace(/\\/g, '/')
+      // ③ 组件文件内容收集：componentsRoot 下、或 pages/views 下的组件文件（受 maxFiles 限制）
+      //    pages/views 条目会随 catalog 流入契约的 referencePages（见 reuse-contract.ts pageReference）
+      const underComponents = /\/components?\//i.test(relFile) || /\/components?$/i.test(rel.replace(/\\/g, '/'))
+      if (underComponents || PAGE_DIR.test(relFile)) {
+        try { componentFiles.push({ abs: p, src: readFileSync(p, 'utf8') }) } catch { /* 解析失败的文件跳过 */ }
+      }
+      const compRoot = dir.replace(/[\\/][^\\/]+$/, '')
       if (/^index\.(tsx|jsx|vue|svelte)$/.test(e)) {
         dirIndex.set(compRoot, (dirIndex.get(compRoot) ?? 0) + 1)
         names.add(dir.split('/').pop() ?? '')
@@ -335,6 +416,16 @@ export function detectProjectConventions(codeDir: string, opts: { maxFiles?: num
   const componentsRoot = layout === 'dir-index' ? di?.[0] : fl?.[0]
   const style = best(styleTally)
 
+  // ③ 真正打开组件文件解析出目录项；解析失败跳过、不猜 props。
+  const components: CatalogComponent[] = []
+  for (const f of componentFiles) {
+    const parsed = parseComponentFile(f.abs, codeDir)
+    if (!parsed) continue
+    parsed.usageSample = findUsageSample(componentFiles, parsed.name)
+    // ④ pages/views 文件作为"相似页面/实现"候选也进 catalog，供 planComponentReuse 塞进 referencePages
+    components.push(parsed)
+  }
+
   return {
     codeDir,
     componentsRoot: componentsRoot ? componentsRoot.replace(codeDir + '/', '') : undefined,
@@ -343,6 +434,7 @@ export function detectProjectConventions(codeDir: string, opts: { maxFiles?: num
     styleExt: style?.[0],
     barrel: [...hasBarrel].some((b) => componentsRoot?.endsWith(b.split('/').pop() ?? '@@') || b.endsWith(componentsRoot ?? '@@')),
     sampleNames: [...names].filter(Boolean).slice(0, 60),
+    ...(components.length ? { components } : {}),
   }
 }
 

@@ -1,0 +1,79 @@
+{
+  "fileKey": "REUSE-FIXTURE",
+  "nodeId": "1:1",
+  "node": {
+    "guid": { "sessionID": 1, "localID": 1 },
+    "type": "FRAME",
+    "name": "ModalPage",
+    "transform": { "m00": 1, "m01": 0, "m02": 0, "m10": 0, "m11": 1, "m12": 0 },
+    "size": { "x": 1200, "y": 800 },
+    "visible": true,
+    "fillPaints": [{ "type": "SOLID", "color": { "r": 1, "g": 1, "b": 1, "a": 1 }, "opacity": 1, "visible": true, "blendMode": "NORMAL" }]
+  },
+  "descendants": [
+    {
+      "guid": { "sessionID": 1, "localID": 2 },
+      "type": "ROUNDED_RECTANGLE",
+      "name": "BG",
+      "transform": { "m00": 1, "m01": 0, "m02": 0, "m10": 0, "m11": 1, "m12": 0 },
+      "size": { "x": 1200, "y": 800 },
+      "visible": true,
+      "parentIndex": { "guid": { "sessionID": 1, "localID": 1 } },
+      "fillPaints": [{ "type": "SOLID", "color": { "r": 0, "g": 0, "b": 0, "a": 0.45 }, "opacity": 1, "visible": true, "blendMode": "NORMAL" }]
+    },
+    {
+      "guid": { "sessionID": 1, "localID": 3 },
+      "type": "FRAME",
+      "name": "Modal",
+      "transform": { "m00": 1, "m01": 0, "m02": 400, "m10": 0, "m11": 1, "m12": 100 },
+      "size": { "x": 400, "y": 600 },
+      "visible": true,
+      "parentIndex": { "guid": { "sessionID": 1, "localID": 1 } },
+      "fillPaints": [{ "type": "SOLID", "color": { "r": 1, "g": 1, "b": 1, "a": 1 }, "opacity": 1, "visible": true, "blendMode": "NORMAL" }]
+    },
+    {
+      "guid": { "sessionID": 1, "localID": 4 },
+      "type": "FRAME",
+      "name": "ModalHeader",
+      "transform": { "m00": 1, "m01": 0, "m02": 400, "m10": 0, "m11": 1, "m12": 100 },
+      "size": { "x": 400, "y": 60 },
+      "visible": true,
+      "parentIndex": { "guid": { "sessionID": 1, "localID": 3 } }
+    },
+    {
+      "guid": { "sessionID": 1, "localID": 5 },
+      "type": "TEXT",
+      "name": "标题",
+      "transform": { "m00": 1, "m01": 0, "m02": 420, "m10": 0, "m11": 1, "m12": 120 },
+      "size": { "x": 200, "y": 24 },
+      "visible": true,
+      "parentIndex": { "guid": { "sessionID": 1, "localID": 4 } },
+      "textData": { "characters": "编辑任务" },
+      "fontName": { "family": "Inter", "style": "Medium" },
+      "fontSize": 16,
+      "fillPaints": [{ "type": "SOLID", "color": { "r": 0.1, "g": 0.1, "b": 0.1, "a": 1 }, "opacity": 1, "visible": true, "blendMode": "NORMAL" }]
+    },
+    {
+      "guid": { "sessionID": 1, "localID": 6 },
+      "type": "FRAME",
+      "name": "ModalBody",
+      "transform": { "m00": 1, "m01": 0, "m02": 400, "m10": 0, "m11": 1, "m12": 160 },
+      "size": { "x": 400, "y": 540 },
+      "visible": true,
+      "parentIndex": { "guid": { "sessionID": 1, "localID": 3 } }
+    },
+    {
+      "guid": { "sessionID": 1, "localID": 7 },
+      "type": "TEXT",
+      "name": "内容",
+      "transform": { "m00": 1, "m01": 0, "m02": 420, "m10": 0, "m11": 1, "m12": 180 },
+      "size": { "x": 300, "y": 20 },
+      "visible": true,
+      "parentIndex": { "guid": { "sessionID": 1, "localID": 6 } },
+      "textData": { "characters": "在这里编辑任务详情" },
+      "fontName": { "family": "Inter", "style": "Regular" },
+      "fontSize": 14,
+      "fillPaints": [{ "type": "SOLID", "color": { "r": 0.3, "g": 0.3, "b": 0.3, "a": 1 }, "opacity": 1, "visible": true, "blendMode": "NORMAL" }]
+    }
+  ]
+}

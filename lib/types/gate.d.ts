@@ -22,6 +22,13 @@ export interface GateInput {
         staticPage: boolean;
         spec: boolean;
     };
+    /**
+     * 组件复用契约状态：由 figma_codegen_round 读 <outDir>/gen/component-reuse.json 得出。
+     * 只有存在 confirmed 契约时才要求 flow.reuseVerification（fail-closed）；默认 false 保持向后兼容。
+     */
+    reuse?: {
+        hasConfirmed: boolean;
+    };
 }
 export interface GateResult {
     ok: boolean;

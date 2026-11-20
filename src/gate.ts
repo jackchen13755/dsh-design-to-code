@@ -22,6 +22,11 @@ export interface GateInput {
   forceReason?: string
   /** 基准产物是否存在（static/index.html 与 static/spec.json） */
   artifacts?: { staticPage: boolean; spec: boolean }
+  /**
+   * 组件复用契约状态：由 figma_codegen_round 读 <outDir>/gen/component-reuse.json 得出。
+   * 只有存在 confirmed 契约时才要求 flow.reuseVerification（fail-closed）；默认 false 保持向后兼容。
+   */
+  reuse?: { hasConfirmed: boolean }
 }
 
 export interface GateResult {
@@ -83,6 +88,23 @@ export function evaluateCloseGate(input: GateInput): GateResult {
       reason: vd
         ? `自动视觉回归未通过（visualDiff.clean=false，findings=${vd.findings}，报告 ${vd.reportPath}）：差异必须清零，或由 figma_confirm_static 登记为 knownDiffs 显式接受后再收尾。`
         : '缺少自动视觉回归记录（flow.json 无 visualDiff）：先跑 figma_visual_diff(output_dir=…, impl=<实现页>)，或由 figma_confirm_static 登记 knownDiffs 显式接受后再收尾。',
+    }
+  }
+
+  // ⑥ 组件复用机器门禁（fail-closed，与 ⑤ 视觉回归判定并列）：
+  //    有 confirmed 复用契约时，必须先跑 figma_verify_reuse 写下 reuseVerification，
+  //    且 clean=true（或 knownDiffs 已显式接受）才许收尾。
+  //    hasConfirmed 由 codegen_round 读 component-reuse.json 得出；没有契约时默认 false → 完全向后兼容。
+  //    这里只读 knownDiffs / reuseVerification，不写 flow。
+  if (input.reuse?.hasConfirmed) {
+    const rv = flow.reuseVerification
+    if ((!rv || !rv.clean) && !hasAcceptedDiffs) {
+      return {
+        ok: false,
+        reason: rv
+          ? `组件复用静态核对未通过（reuseVerification.clean=false，缺失 import：${rv.missingImports.slice(0, 5).join(', ') || '（无明细）'}）：confirmed 契约的 projectComponent 必须在实现源码真实出现；补齐后重跑 figma_verify_reuse，或由 figma_confirm_static 登记 knownDiffs 显式接受后再收尾。`
+          : '缺少组件复用静态核对记录（flow.json 无 reuseVerification）：先跑 figma_verify_reuse(output_dir=…, impl_src=<实现源码目录>)，或由 figma_confirm_static 登记 knownDiffs 显式接受后再收尾。',
+      }
     }
   }
 

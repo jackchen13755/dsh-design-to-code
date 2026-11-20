@@ -20,6 +20,9 @@ import { detectRepeats, detectSections, reliableSections, subtreeDesignIds, reus
 import { renderRequirementsCrosswalk } from './requirements-crosswalk.js'
 import type { AuditResult } from './audit.js'
 import { iconRefOf } from './icons.js'
+// 冻结契约（席位A 新建 src/reuse-contract.ts）只读消费：类型导入在运行时被擦除，
+// 故本文件在无该文件时仍可被 ts.transpileModule 转译并跑单测；typecheck 需该文件落地。
+import type { ComponentReuseContract } from './reuse-contract.js'
 
 export interface CodegenOptions {
   componentName: string
@@ -44,6 +47,219 @@ export interface CodegenOptions {
   /** 当前轮次 */
   round?: number
   roundFeedback?: string
+  /** 壳/组件级复用契约（席位A reuse-contract.ts 产出）；默认空，空时 Prompt 段与 Shell 骨架整段省略 */
+  reuseContracts?: ComponentReuseContract[]
+}
+
+// ── 壳/组件级复用契约：只读消费的纯函数（无副作用，边界全覆盖）────────────
+
+/** level 排序：shell → control → business；未知等级排最后，保证稳定顺序 */
+const REUSE_LEVEL_RANK: Record<string, number> = { shell: 0, control: 1, business: 2 }
+const reuseRank = (c: ComponentReuseContract): number =>
+  REUSE_LEVEL_RANK[String(c.level ?? '')] ?? 9
+/** shell 判定：level 或 role 命中 shell 即算；明确是 content 角色的不冒充壳 */
+const isShellContract = (c: ComponentReuseContract): boolean => {
+  const role = String(c.role ?? '')
+  const level = String(c.level ?? '')
+  if (role === 'content') return false
+  return level === 'shell' || role === 'shell'
+}
+
+/** data-reuse-role 取值：优先契约的 role（非 unknown 时），否则按 level 推导 */
+const reuseRoleOf = (c: ComponentReuseContract): string => {
+  const role = String(c.role ?? '').trim()
+  if (role && role !== 'unknown') return role
+  const level = String(c.level ?? '')
+  return level === 'shell' ? 'shell' : (level === 'control' || level === 'business') ? 'control' : 'unknown'
+}
+
+/** slot 里的 map 字段（extraSlots/valueProps/eventProps）形状未定死，统一兜底格式化 */
+const fmtSlotMap = (v: unknown): string => {
+  if (v == null) return ''
+  if (typeof v === 'string') return v
+  if (Array.isArray(v)) return v.map((x) => String(x)).join(', ')
+  if (typeof v === 'object') {
+    return Object.entries(v as Record<string, unknown>).map(([k, x]) => `${k}:${String(x)}`).join(', ')
+  }
+  return String(v)
+}
+
+/** valueProps/eventProps → [jsx属性名, props字段] 对：兼容 string[]（值为属性名）与 Record（显式映射）两种形状 */
+const slotPropPairs = (v: unknown): Array<[string, string]> => {
+  if (v == null) return []
+  if (Array.isArray(v)) return v.map((x) => [String(x), String(x)] as [string, string])
+  if (typeof v === 'object') {
+    return Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, String(x)] as [string, string])
+  }
+  return []
+}
+
+/** 插入 CODEGEN_PROMPT 的复用契约段：空数组返回 []（整段省略） */
+function renderReuseContractsSection(contracts: ComponentReuseContract[]): string[] {
+  if (!contracts.length) return []
+  const sorted = [...contracts].sort((a, b) => reuseRank(a) - reuseRank(b))
+  const out: string[] = [
+    '',
+    '## 壳/组件级复用契约（三层统一：项目既有组件 ↔ 设计节点）',
+    '',
+    '设计稿是静态的，但项目已有组件库：本表逐条把设计节点绑定到项目既有组件，实现时**只做内容/差异部分**。',
+    '层级顺序：shell（Drawer/Modal 等壳）→ control（Input/Select/Tag 等控件）→ business（业务组件），按此序落在表里。',
+    '| 契约ID | 层级 | 设计节点 | 图层名 | 项目组件 | import路径 | slot/children契约 | 需实现的内容区(节点ID) | 不重建的外壳节点 | 状态 | 验证方式 |',
+    '|---|---|---|---|---|---|---|---|---|---|---|',
+  ]
+  for (const c of sorted) {
+    const m = c.match ?? ({} as NonNullable<ComponentReuseContract['match']>)
+    const status = String(m.status ?? '—')
+    const source = String(m.source ?? '—')
+    const confidence = typeof m.confidence === 'number' ? m.confidence.toFixed(2) : '-'
+    const importCell = c.importPath && String(c.importPath).trim()
+      ? `\`${String(c.importPath)}\``
+      : (status === 'suspected' && source !== 'code-dir' ? '去项目 grep 确认' : '—')
+    const s = c.slot ?? ({} as NonNullable<ComponentReuseContract['slot']>)
+    const slotParts: string[] = []
+    if (s.contentSlot) slotParts.push(`content→${s.contentSlot}`)
+    if (s.headerSlot) slotParts.push(`header→${s.headerSlot}`)
+    const extra = fmtSlotMap(s.extraSlots); if (extra) slotParts.push(`extra:${extra}`)
+    const vals = fmtSlotMap(s.valueProps); if (vals) slotParts.push(`value:${vals}`)
+    const evs = fmtSlotMap(s.eventProps); if (evs) slotParts.push(`event:${evs}`)
+    if (c.nested?.length) slotParts.push(`nested→${c.nested.join('/')}`)
+    const contentIds = (s.contentDesignNodeIds ?? []).map(String).join(', ') || '—'
+    const omitIds = (s.omitDesignNodeIds ?? []).map(String).join(', ') || '—'
+    const verify = c.verify
+    const verifyCell = [
+      verify?.nodeId ? `节点 ${verify.nodeId}` : '',
+      verify?.note ? String(verify.note) : '',
+      `来源 ${source}/${confidence}`,
+    ].filter(Boolean).join('；')
+    const cells = [
+      String(c.id ?? '—'), String(c.level ?? '—'), String(c.designNodeId ?? '—'), String(c.designName ?? '—'),
+      String(c.projectComponent ?? '—'), importCell, slotParts.join('；') || 'children（默认插槽）',
+      contentIds, omitIds, status, verifyCell,
+    ]
+    out.push(`| ${cells.map(cellOf).join(' | ')} |`)
+  }
+  out.push(
+    '',
+    '硬规则（逐条必做；与《组件边界契约》冲突时**以本表为准**）：',
+    '1. shell 级**不重画外壳**，只实现「需实现的内容区(节点ID)」并套入契约的 slot/children；',
+    '2. control/business 级节点复用项目组件，**禁止自绘**控件（Input/Select/Tag/Drawer/Modal…）；',
+    '3. **suspected 先确认**：status=suspected 的条目先确认再落代码，不得静默套用；',
+    '4. 同一节点既在《组件边界契约》又在本表时**以本表为准**（项目组件提供，不再生成单元组件）；',
+    '5. nested 逐层套：按 nested 顺序由外到内嵌套项目组件与其 slot。',
+    '',
+  )
+  return out
+}
+
+/** 生成套用项目组件的 Shell 骨架源码；无 shell 契约时返回空串（不生成文件） */
+function renderShellSkeleton(name: string, contracts: ComponentReuseContract[]): string {
+  const sorted = [...contracts].sort((a, b) => reuseRank(a) - reuseRank(b))
+  const shells = sorted.filter(isShellContract)
+  if (!shells.length) return ''
+
+  const byId = new Map(sorted.map((c) => [String(c.id), c]))
+  const nestedTargets = new Set<string>()
+  for (const c of sorted) for (const id of c.nested ?? []) nestedTargets.add(String(id))
+  const roots = shells.filter((c) => !nestedTargets.has(String(c.id)))
+  const top = roots.length ? roots : shells
+
+  // import：有 importPath 用契约值，否则写占位注释（含所缺组件名，便于 grep 定位）
+  const importLines: string[] = []
+  const seen = new Set<string>()
+  for (const c of sorted) {
+    const comp = String(c.projectComponent ?? '').trim()
+    if (!comp || seen.has(comp)) continue
+    seen.add(comp)
+    const p = String(c.importPath ?? '').trim().replace(/'/g, "\\'")
+    importLines.push(p ? `import { ${comp} } from '${p}';` : `// TODO: 确认 import 路径（契约 ${String(c.id)}：${comp}）`)
+  }
+  if (!importLines.length) importLines.push('// TODO: 确认 import 路径')
+
+  const renderedControls = new Set<string>()
+
+  const renderOne = (c: ComponentReuseContract, ind: string, stack: Set<string>): string => {
+    const cid = String(c.id)
+    if (stack.has(cid)) return `${ind}{/* nested 循环引用，跳过 ${escText(cid)} */}`
+    const nextStack = new Set(stack); nextStack.add(cid)
+    const s = c.slot ?? ({} as NonNullable<ComponentReuseContract['slot']>)
+    const comp = String(c.projectComponent ?? '').replace(/[^\w$]/g, '') || 'ReusedComponent'
+    const contentIds = (s.contentDesignNodeIds ?? []).map(String)
+    const childLines: string[] = []
+    const covered = new Set<string>()
+    for (const nid of c.nested ?? []) {
+      const child = byId.get(String(nid))
+      if (!child) continue
+      covered.add(String(child.designNodeId ?? ''))
+      childLines.push(renderOne(child, `${ind}  `, nextStack))
+    }
+    let hasGenericContent = false
+    for (const nid of contentIds) {
+      if (covered.has(nid)) continue
+      const ctrl = sorted.find((x) => !isShellContract(x) && String(x.designNodeId) === nid && !renderedControls.has(String(x.id)))
+      if (ctrl) {
+        renderedControls.add(String(ctrl.id))
+        childLines.push(`${ind}  <div data-reuse-role="control" data-reuse-contract="${escAttr(ctrl.id)}" data-design-id="${escAttr(ctrl.designNodeId)}">TODO: 用项目组件 ${escText(ctrl.projectComponent)} 替换（禁止自绘）</div>`)
+      } else {
+        childLines.push(`${ind}  <div data-reuse-role="content" data-reuse-contract="${escAttr(cid)}" data-design-id="${escAttr(nid)}">TODO: 实现内容区</div>`)
+        hasGenericContent = true
+      }
+    }
+    // 边界兜底：即便所有内容节点都被控件契约接管（或没有内容节点），也保证壳里有一个标准 content 挂载点
+    if (!hasGenericContent) {
+      childLines.push(`${ind}  <div data-reuse-role="content" data-reuse-contract="${escAttr(cid)}">TODO: 实现内容区</div>`)
+    }
+    const attrs: string[] = []
+    const headerSlot = String(s.headerSlot ?? '').trim()
+    if (headerSlot) attrs.push(`${headerSlot}={<div data-reuse-role="content" data-reuse-contract="${escAttr(cid)}">TODO: 实现头部内容区</div>}`)
+    for (const [prop, src] of slotPropPairs(s.valueProps)) attrs.push(`${prop}={props.${src}}`)
+    for (const [prop, src] of slotPropPairs(s.eventProps)) attrs.push(`${prop}={props.${src}}`)
+    const contentSlot = String(s.contentSlot ?? '').trim()
+    const childrenJsx = `\n${childLines.join('\n')}\n${ind}`
+    if (contentSlot && contentSlot !== 'children') {
+      attrs.push(`${contentSlot}={<>${childrenJsx}</>}`)
+      return `${ind}<${comp}${attrs.length ? ` ${attrs.join(' ')}` : ''} />`
+    }
+    return `${ind}<${comp}${attrs.length ? ` ${attrs.join(' ')}` : ''}>${childrenJsx}</${comp}>`
+  }
+
+  const body = top.map((c) => renderOne(c, '      ', new Set())).join('\n')
+  const leftover = sorted.filter((x) => !isShellContract(x) && !renderedControls.has(String(x.id)))
+  const leftoverJsx = leftover.map((x) => `      <div data-reuse-role="control" data-reuse-contract="${escAttr(x.id)}" data-design-id="${escAttr(x.designNodeId)}">TODO: 用项目组件 ${escText(x.projectComponent)} 替换（禁止自绘）</div>`).join('\n')
+
+  const propsUsed = new Set<string>()
+  for (const c of sorted) {
+    const s = c.slot ?? ({} as NonNullable<ComponentReuseContract['slot']>)
+    for (const [, src] of slotPropPairs(s.valueProps)) propsUsed.add(src)
+    for (const [, src] of slotPropPairs(s.eventProps)) propsUsed.add(src)
+  }
+  const propsDecl = [...propsUsed].map((p) => `  /** 由复用契约透传 */\n  ${p}?: unknown;`).join('\n') || '  // 内容区可按需扩展 props'
+
+  const firstNode = sorted[0]?.designNodeId ?? ''
+  return [
+    `// 由设计稿 ${escText(String(firstNode))} + 复用契约生成的**套用骨架**。`,
+    '// 壳/控件复用项目既有组件：只实现 content 标注的内容区，control 标注的节点禁止自绘。',
+    '// 这是骨架起点：按 CODEGEN_PROMPT.md《壳/组件级复用契约》逐条落实后删除 TODO。',
+    "import type { ReactNode } from 'react';",
+    ...importLines,
+    '',
+    `export interface ${name}ShellProps {`,
+    propsDecl,
+    '  children?: ReactNode;',
+    '}',
+    '',
+    `export function ${name}Shell(props: ${name}ShellProps) {`,
+    '  void props;',
+    '  return (',
+    '    <>',
+    body,
+    leftoverJsx,
+    '    </>',
+    '  );',
+    '}',
+    '',
+    `export default ${name}Shell;`,
+    '',
+  ].join('\n')
 }
 
 function safeName(name: string): string {
@@ -212,6 +428,8 @@ interface EmitCtx {
   instanceTodo: string[]
   cls: (decl: string) => string
   boundaryFor: (n: DesignNode) => UnitComponent | undefined
+  /** 命中复用契约的节点 → 契约（只读消费，仅加 data-* 属性，不改布局逻辑） */
+  reuseFor: (n: DesignNode) => ComponentReuseContract | undefined
   uid: () => number
 }
 
@@ -233,6 +451,11 @@ function boxDecls(n: DesignNode, parent: DesignNode | undefined, inFlow: boolean
 function emitNode(n: DesignNode, parent: DesignNode | undefined, indent: string, ctx: EmitCtx, index = 0): void {
   const inFlow = flowsInParent(n, parent)
   const boundary = ctx.boundaryFor(n)
+  // 复用契约命中：只往已生成的标签上挂 data-reuse-role/data-reuse-contract，绝不改定位/尺寸/布局
+  const reuseHit = ctx.reuseFor(n)
+  const reuseAttr = reuseHit
+    ? ` data-reuse-role="${escAttr(reuseRoleOf(reuseHit))}" data-reuse-contract="${escAttr(reuseHit.id)}"`
+    : ''
   if (boundary) {
     const decl = [...boxDecls(n, parent, inFlow), 'box-sizing: border-box']
     const c = ctx.cls(decl.join(';\n  '))
@@ -242,7 +465,7 @@ function emitNode(n: DesignNode, parent: DesignNode | undefined, indent: string,
       .join(' ')
     // section 的根节点是对比锚点，wrapper 上保留 data-design-id；repeat 维持现状（不带）
     const anchorAttr = boundary.kind === 'section' ? ` data-design-id="${escAttr(n.id)}"` : ''
-    ctx.jsx.push(`${indent}<div className={styles.${c}}${anchorAttr}><${boundary.name}${props ? ` ${props}` : ''} /></div>`)
+    ctx.jsx.push(`${indent}<div className={styles.${c}}${anchorAttr}${reuseAttr}><${boundary.name}${props ? ` ${props}` : ''} /></div>`)
     return
   }
 
@@ -266,7 +489,7 @@ function emitNode(n: DesignNode, parent: DesignNode | undefined, indent: string,
     else if (t?.autoResize === 'TRUNCATE') d.push('white-space: nowrap', 'overflow: hidden', 'text-overflow: ellipsis')
     else d.push('white-space: pre', 'overflow: visible')
     const c = ctx.cls(d.join(';\n  '))
-    ctx.jsx.push(`${indent}<span className={styles.${c}} data-design-id="${escAttr(n.id)}">${jsxText(n.value ?? '')}</span>`)
+    ctx.jsx.push(`${indent}<span className={styles.${c}} data-design-id="${escAttr(n.id)}"${reuseAttr}>${jsxText(n.value ?? '')}</span>`)
     return
   }
 
@@ -292,7 +515,7 @@ function emitNode(n: DesignNode, parent: DesignNode | undefined, indent: string,
       if (!n.border) d.push('border-style: solid', `border-color: ${ctx.ds.line}`, 'border-width: 1px')
       d.push(`border-radius: ${rad.value}`)
       const c = ctx.cls(d.join(';\n  '))
-      ctx.jsx.push(`${indent}<div className={styles.${c}} data-design-id="${escAttr(n.id)}" data-design-name="${designName}">`
+      ctx.jsx.push(`${indent}<div className={styles.${c}} data-design-id="${escAttr(n.id)}" data-design-name="${designName}"${reuseAttr}>`
         + `<input className={styles.instInput} defaultValue=${jsxText(n.value ?? '')} aria-label="${escAttr(n.name)}" /></div>`)
       return
     }
@@ -302,7 +525,7 @@ function emitNode(n: DesignNode, parent: DesignNode | undefined, indent: string,
       d.push('display: flex', 'align-items: center', 'justify-content: center')
       d.push(`border-radius: ${radiusDecl(n, ctx.ds.radius).value}`)
       const c = ctx.cls(d.join(';\n  '))
-      ctx.jsx.push(`${indent}<button type="button" className={styles.${c}} data-design-id="${escAttr(n.id)}" data-design-name="${designName}"`
+      ctx.jsx.push(`${indent}<button type="button" className={styles.${c}} data-design-id="${escAttr(n.id)}" data-design-name="${designName}"${reuseAttr}`
         + ` onClick={() => onAction?.(${JSON.stringify(n.value ?? n.name)}, data)}>${jsxText(n.value ?? n.name)}</button>`)
       return
     }
@@ -310,19 +533,19 @@ function emitNode(n: DesignNode, parent: DesignNode | undefined, indent: string,
       if (!n.border) d.push('border-style: solid', `border-color: ${ctx.ds.line}`, 'border-width: 1px')
       d.push('border-radius: 50%')
       const c = ctx.cls(d.join(';\n  '))
-      ctx.jsx.push(`${indent}<input type="radio" className={styles.${c}} data-design-name="${designName}" name="design-radio-${inst}" />`)
+      ctx.jsx.push(`${indent}<input type="radio" className={styles.${c}} data-design-name="${designName}" name="design-radio-${inst}"${reuseAttr} />`)
       return
     }
     if (tag === 'required') {
       d.push('color: #e64545', 'display: flex', 'align-items: center')
       const c = ctx.cls(d.join(';\n  '))
-      ctx.jsx.push(`${indent}<span className={styles.${c}} data-design-name="${designName}" aria-hidden="true">*</span>`)
+      ctx.jsx.push(`${indent}<span className={styles.${c}} data-design-name="${designName}" aria-hidden="true"${reuseAttr}>*</span>`)
       return
     }
     d.push(`border-radius: ${radiusDecl(n, ctx.ds.radius).value}`)
     const c = ctx.cls(d.join(';\n  '))
     const iconRef = iconRefOf(n)
-    ctx.jsx.push(`${indent}<span className={styles.${c}} data-design-id="${escAttr(n.id)}" data-design-name="${designName}"${iconRef ? ` data-icon-library="${escAttr(iconRef.name)}"` : ''}>${jsxText(n.value ?? (iconRef ? '' : n.name))}</span>`)
+    ctx.jsx.push(`${indent}<span className={styles.${c}} data-design-id="${escAttr(n.id)}" data-design-name="${designName}"${iconRef ? ` data-icon-library="${escAttr(iconRef.name)}"` : ''}${reuseAttr}>${jsxText(n.value ?? (iconRef ? '' : n.name))}</span>`)
     return
   }
 
@@ -332,7 +555,7 @@ function emitNode(n: DesignNode, parent: DesignNode | undefined, indent: string,
     else ctx.instanceTodo.push(`- ${n.id} \`${n.name}\`：没有图标库标识，先在项目图标库中确认映射，不要按名字猜或按路径临摹`)
     d.push('border-style: dashed', `border-color: ${ctx.ds.lineStrong}`, 'border-width: 1px', 'border-radius: 2px')
     const c = ctx.cls(d.join(';\n  '))
-    ctx.jsx.push(`${indent}{/* 图标占位：使用项目图标库的 SVG，不要从 Figma 路径自绘 */}\n${indent}<div className={styles.${c}} data-design-id="${escAttr(n.id)}"${iconRef ? ` data-icon-library="${escAttr(iconRef.name)}"` : ''} aria-hidden="true" />`)
+    ctx.jsx.push(`${indent}{/* 图标占位：使用项目图标库的 SVG，不要从 Figma 路径自绘 */}\n${indent}<div className={styles.${c}} data-design-id="${escAttr(n.id)}"${iconRef ? ` data-icon-library="${escAttr(iconRef.name)}"` : ''}${reuseAttr} aria-hidden="true" />`)
     return
   }
 
@@ -340,10 +563,10 @@ function emitNode(n: DesignNode, parent: DesignNode | undefined, indent: string,
   const visibleKids = n.children.filter((x) => x.raw.visible !== false)
   const kids = n.layout?.mode ? orderFlow(visibleKids, n) : visibleKids
   if (!kids.length) {
-    ctx.jsx.push(`${indent}<div className={styles.${c}} data-design-id="${escAttr(n.id)}" />`)
+    ctx.jsx.push(`${indent}<div className={styles.${c}} data-design-id="${escAttr(n.id)}"${reuseAttr} />`)
     return
   }
-  ctx.jsx.push(`${indent}<div className={styles.${c}} data-design-id="${escAttr(n.id)}">`)
+  ctx.jsx.push(`${indent}<div className={styles.${c}} data-design-id="${escAttr(n.id)}"${reuseAttr}>`)
   for (let i = 0; i < kids.length; i++) emitNode(kids[i], n, `${indent}  `, ctx, i)
   ctx.jsx.push(`${indent}</div>`)
 }
@@ -353,6 +576,14 @@ export function generateCode(model: DesignModel, opts: CodegenOptions): string[]
   const ds = inferDesignSystem(model)
   const outDir = resolve(opts.outputDir)
   mkdirSync(join(outDir, 'src'), { recursive: true })
+
+  // ── 复用契约（席位A 冻结契约，只读消费）：设计节点 → 契约；空数组时全部行为退化为无复用 ──
+  const reuseContracts = opts.reuseContracts ?? []
+  const reuseByNodeId = new Map<string, ComponentReuseContract>()
+  for (const c of reuseContracts) {
+    if (c.designNodeId) reuseByNodeId.set(String(c.designNodeId), c)
+  }
+  const reuseFor = (n: DesignNode): ComponentReuseContract | undefined => reuseByNodeId.get(n.id)
 
   // ── 组件化：顶层分区（section，页面骨架）+ 重复结构（repeat，可复用零件）= 单元组件，页面只负责组合 ──
   const maxExtract = Math.max(0, Number(opts.maxExtract ?? 3))
@@ -487,6 +718,7 @@ export function generateCode(model: DesignModel, opts: CodegenOptions): string[]
       return id
     },
     boundaryFor,
+    reuseFor,
     uid: () => uid++,
   }
 
@@ -527,6 +759,14 @@ export default ${name};
   )
 
   writeFileSync(join(outDir, 'src', `${name}.module.css`), `${cssRules.join('\n\n')}\n`, 'utf8')
+
+  // ── 套用骨架：有 shell 级复用契约时生成 src/${name}Shell.tsx；无 shell 契约时不生成（向后兼容）──
+  let shellFile: string | undefined
+  const shellSrc = renderShellSkeleton(name, reuseContracts)
+  if (shellSrc) {
+    shellFile = join(outDir, 'src', `${name}Shell.tsx`)
+    writeFileSync(shellFile, shellSrc, 'utf8')
+  }
 
   // ── 单元组件文件：顶层分区（section）+ 重复结构（repeat）各出一个文件，带 props/锚点注释 ──
   const relComponents: string[] = []
@@ -658,6 +898,8 @@ ${styles.join('\n')}
     P.push('工具会据完整设计树算出该节点的后代锚点集合，只把 spec.rows 的这一子集拿去比对——细节偏差不再淹没在整页里。')
     P.push('node_id 支持 dash/colon 两种写法（如 `110-854` / `110:854`）；对所有单元组件逐个跑完才算完成机器回归。', '')
   }
+  // 壳/组件级复用契约段：与《组件边界契约》同源同序，空数组时整段省略
+  if (reuseContracts.length) P.push(...renderReuseContractsSection(reuseContracts))
   if (opts.auditMd) {
     P.push('', '## 设计审计核对清单（逐项勾选；"真歧义"才需要问人，"数据缺失"按兜底规则做）', '', '```markdown', opts.auditMd.trim(), '```', '')
   }
@@ -749,6 +991,15 @@ ${styles.join('\n')}
     '9. **设计备注逐条落实**：`## 设计备注 = 交互说明` 的强制映射表每行都要填满「承载 props/state | 事件 | 真实控件/行为 | 文件 | 验证」，空着即未完成；候选备注先标待确认、不得静默丢弃；',
     '   交付说明逐条回答承载字段、实现文件、验证方式。只抄成注释或静默忽略都算未完成。',
     '10. **设计标题逐条对照**：`## 设计标题` 每条用于组件/分区命名与可访问性标题（page→h1、section→h2），按证据节点核对文案与字号，不臆造、不改写、不遗漏。',
+    ...(reuseContracts.length ? [
+      '11. **壳/组件级复用（三层统一）**：命中《壳/组件级复用契约》的节点按契约复用项目既有组件——',
+      '    ① shell 级**不重画外壳**，只实现「需实现的内容区(节点ID)」并套入契约的 slot/children；',
+      '    ② control/business 级节点复用项目组件，**禁止自绘**控件（Input/Select/Tag/Drawer/Modal…）；',
+      '    ③ **suspected 先确认**：suspected 条目先确认再落代码，不得静默套用；',
+      '    ④ 同一节点既在《组件边界契约》又在本表时**以本表为准**（项目组件提供，不再生成单元组件）；',
+      '    ⑤ nested 逐层套：按 nested 顺序由外到内嵌套项目组件与其 slot。',
+      '    骨架见 `src/${name}Shell.tsx`（有 shell 契约时生成），data-reuse-role/content/control 标注即实现落点。',
+    ] : []),
     '',
     '## 已知占位（不是实现缺陷，不要"修"它）',
     '- 带 `data-src="placeholder"` / `data-guessed` 的元素是设计数据缺失处（实例内部、矢量图标、位图）；',
@@ -770,6 +1021,12 @@ ${styles.join('\n')}
     '   逐条修复 → `action="close"` 关闭 → **再提审一轮拿 pass**（开发自述"改完了"不算通过）；',
     '7. 把查到的项目既有模式沉淀成可复用事实；',
     '8. 设计备注 + 设计标题逐条对照：备注按强制映射表填满「承载 props/state | 事件 | 真实控件/行为 | 文件 | 验证」，候选（待确认）先标记再落实、不得静默丢弃；标题逐条核对命名与可访问性标题（page→h1、section→h2）及证据节点；确实无法实现的要显式说明原因，不能静默跳过。',
+    ...(reuseContracts.length ? [
+      '9. **复用契约逐条核验**：按《壳/组件级复用契约》表逐条核对——',
+      '    ① shell 外壳未重画、内容区已套入 slot/children；② control/business 节点复用项目组件、无自绘控件；',
+      '    ③ suspected 条目已确认（未确认即未完成）；④ 与《组件边界契约》重叠处按本表实现、未生成重复单元组件；',
+      '    ⑤ nested 层级与契约一致；并在 `src/${name}Shell.tsx` 与节点的 data-reuse-contract 标注处核对实现落点。',
+    ] : []),
   )
   writeFileSync(join(outDir, 'CODEGEN_PROMPT.md'), P.join('\n'), 'utf8')
 
@@ -797,6 +1054,7 @@ ${styles.join('\n')}
     join(outDir, 'src', 'types.ts'),
     join(outDir, 'src', `${name}.tsx`),
     join(outDir, 'src', `${name}.module.css`),
+    ...(shellFile ? [shellFile] : []),
     join(outDir, 'src', 'index.ts'),
     join(outDir, 'CODEGEN_PROMPT.md'),
     join(outDir, 'README.md'),

@@ -1,4 +1,5 @@
 import type { DesignModel } from './design.js';
+import type { CatalogComponent } from './reuse-contract.js';
 export interface RepeatGroup {
     /** 结构指纹 */
     signature: string;
@@ -46,6 +47,8 @@ export interface ProjectConventions {
     barrel?: boolean;
     /** 现成组件名样例（供复用匹配） */
     sampleNames: string[];
+    /** ③ 探测深化：真正打开组件文件解析出的组件目录（props/slot/importPath/usage）。缺 codeDir 时不存在。 */
+    components?: CatalogComponent[];
 }
 /** 重复结构 → 该抽成可复用组件的候选 */
 export declare function detectRepeats(model: DesignModel, opts?: {
